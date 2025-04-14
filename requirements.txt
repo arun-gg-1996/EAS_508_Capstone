@@ -4,4 +4,5 @@ pandas>=1.2.0
 matplotlib>=3.3.0
 statsmodels>=0.12.0
 pyarrow
-tqdm
+tqdm~=4.67.1
+PyWavelets>=1.6.0
