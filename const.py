@@ -34,3 +34,23 @@ TEST_SAMPLE_SIZE_FREQ = 0.05
 WAVELET_DOMAIN_OUT_PATH = os.path.join(current_folder, "out", "main", "eeg_wavelet_domain_features.csv")
 WAVELET_DOMAIN_OUT_PATH_TEST = os.path.join(current_folder, "out", "test", "eeg_wavelet_domain_features_test.csv")
 TEST_SAMPLE_SIZE_WAVELET = 0.05
+
+############################## NON LINEAR DOMAIN FEATURES ##############################
+NONLINEAR_DOMAIN_OUT_PATH_TEST = os.path.join(current_folder, "out", "test", "eeg_nonlinear_domain_features_test.csv")
+NONLINEAR_DOMAIN_OUT_PATH = os.path.join(current_folder, "out", "main", "eeg_nonlinear_domain_features.csv")
+TEST_SAMPLE_SIZE_NONLINEAR = 0.05
+
+############################## EMBEDDING FEATURES ##############################
+BRAINDECODE_EMBEDDINGS_PATH = os.path.join(current_folder, "out", "test", "eeg_nonlinear_domain_features.csv")
+BRAINDECODE_EMBEDDINGS_PATH_TEST = os.path.join(current_folder, "out", "test", "eeg_nonlinear_domain_features_test.csv")
+
+############################## VISION FEATURES #################################
+# Path configurations - adjust these to match your file structure
+TRAIN_SPECTROGRAMS_DIR = os.path.join(DATA_FOLDER, 'train_spectrograms')
+TRAIN_CSV_PATH = os.path.join(DATA_FOLDER, 'train.csv')
+OUTPUT_DIR_TEST = os.path.join(current_folder, "out", "test")
+OUTPUT_FILE_TEST = os.path.join(OUTPUT_DIR_TEST, 'spectrogram_embeddings.csv')
+
+OUTPUT_DIR_ANALYSIS_TEST = os.path.join(current_folder, 'out', 'test', 'analysis')
+# Create output directory
+os.makedirs(OUTPUT_DIR_ANALYSIS_TEST, exist_ok=True)
