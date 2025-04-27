@@ -112,4 +112,4 @@ def main(test_mode=True, fs=SAMPLE_RATE):
 if __name__ == "__main__":
     # By default, run in test mode with a sampling frequency of 250 Hz
     # Change to main(False) to run on the full dataset
-    main(test_mode=True, fs=SAMPLE_RATE)
+    main(test_mode=False, fs=SAMPLE_RATE)

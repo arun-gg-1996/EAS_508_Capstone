@@ -21,22 +21,12 @@ class WaveletPerformanceTester:
     def run_benchmark(self, n_samples=50, verbose=True, fs=SAMPLE_RATE):
         """
         Benchmark wavelet feature extraction on multiple EEG samples
-
-        Parameters:
-            n_samples (int): Number of samples to process
-            verbose (bool): Whether to print progress and results
-            fs (int): Sampling frequency in Hz
-
-        Returns:
-            dict: Performance metrics
         """
         # Get the train data
         train_df = self.data_reader.get_train_df()
 
         # Get a random sample
         if len(train_df) < n_samples:
-            if verbose:
-                print(f"Warning: Requested {n_samples} samples but only {len(train_df)} are available")
             samples = train_df
         else:
             samples = train_df.sample(n=n_samples, random_state=42)
@@ -98,18 +88,6 @@ class WaveletPerformanceTester:
         print(f"Average number of features per sample: {results['avg_feature_count']:.1f}")
 
 
-def test_different_wavelets():
-    """Test performance with different wavelet types"""
-    n_samples = 10
-    wavelets = ['db4', 'sym4', 'coif3', 'haar']
-
-    print("Comparing performance of different wavelet types:")
-    for wavelet in wavelets:
-        print(f"\nTesting with wavelet type: {wavelet}")
-        tester = WaveletPerformanceTester(wavelet=wavelet)
-        tester.run_benchmark(n_samples=n_samples)
-
-
 def test():
     n_samples = 50  # Using fewer samples as wavelet transform is computationally intensive
     print(f"Testing wavelet feature extraction on {n_samples} EEG samples...")
@@ -129,9 +107,6 @@ def test():
         print("...")
 
     print(f"Number of features: {len(features)}")
-
-    # Uncomment to test different wavelet types
-    # test_different_wavelets()
 
 
 if __name__ == "__main__":

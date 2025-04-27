@@ -1,15 +1,16 @@
 import os
+import time
+
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import ViTFeatureExtractor, ViTModel
-import pyarrow.parquet as pq
 from tqdm import tqdm
-import time
-import gc
+from transformers import ViTFeatureExtractor, ViTModel
 
-from const import TRAIN_SPECTROGRAMS_DIR, TRAIN_CSV_PATH, OUTPUT_DIR_TEST, OUTPUT_FILE_TEST
+from const import TRAIN_SPECTROGRAMS_DIR, TRAIN_CSV_PATH, VIT_EMBEDDINGS_PATH_TEST, \
+    VIT_EMBEDDINGS_PATH, TEST_SAMPLE_SIZE_VISION, VISION_TSNE_FILE_TEST, VISION_TSNE_FILE
 
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -52,6 +53,9 @@ class SpectrogramDataset(Dataset):
         eeg_id = row['eeg_id']
         eeg_sub_id = row['eeg_sub_id']
 
+        # Get expert_consensus if available
+        expert_consensus = row.get('expert_consensus', 'Unknown')
+
         # Cache key is spectrogram_id
         cache_key = spec_id
 
@@ -88,6 +92,7 @@ class SpectrogramDataset(Dataset):
                     'spectrogram_sub_id': sub_id,
                     'eeg_id': eeg_id,
                     'eeg_sub_id': eeg_sub_id,
+                    'expert_consensus': expert_consensus,
                     'row_idx': idx,
                     'error': True
                 }
@@ -119,6 +124,7 @@ class SpectrogramDataset(Dataset):
                 'spectrogram_sub_id': sub_id,
                 'eeg_id': eeg_id,
                 'eeg_sub_id': eeg_sub_id,
+                'expert_consensus': expert_consensus,
                 'offset_seconds': offset_seconds,
                 'row_idx': idx
             }
@@ -131,13 +137,14 @@ class SpectrogramDataset(Dataset):
                 'spectrogram_sub_id': sub_id,
                 'eeg_id': eeg_id,
                 'eeg_sub_id': eeg_sub_id,
+                'expert_consensus': expert_consensus,
                 'offset_seconds': 0.0,
                 'row_idx': idx,
                 'error': True
             }
 
 
-def extract_subsample_embeddings(output_file=OUTPUT_FILE_TEST, batch_size=16, num_workers=2, sample=None):
+def extract_subsample_embeddings(output_file=VIT_EMBEDDINGS_PATH_TEST, batch_size=16, num_workers=2, sample=None):
     """
     Extract embeddings for each EEG ID and subsample
 
@@ -221,6 +228,10 @@ def extract_subsample_embeddings(output_file=OUTPUT_FILE_TEST, batch_size=16, nu
                         batch['offset_seconds'][i]) else batch['offset_seconds'][i],
                 }
 
+                # Add expert_consensus if available
+                if 'expert_consensus' in batch:
+                    row['expert_consensus'] = batch['expert_consensus'][i]
+
                 # Add embedding values
                 for j, val in enumerate(embeddings[i]):
                     row[f'embedding_{j}'] = val.item() if isinstance(val, np.float32) else val
@@ -249,56 +260,89 @@ def extract_subsample_embeddings(output_file=OUTPUT_FILE_TEST, batch_size=16, nu
     return embeddings_df
 
 
-def visualize_subsample_embeddings(embeddings_df, output_dir=OUTPUT_DIR_TEST):
+def visualize_subsample_embeddings(embeddings_df, out_file):
     """
     Visualize the subsample embeddings
 
     Args:
         embeddings_df: DataFrame with embeddings
-        output_dir: Directory to save visualizations
+        out_file: file to save visualization
     """
     try:
         from sklearn.manifold import TSNE
         import matplotlib.pyplot as plt
         import plotly.express as px
 
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
-
         print("Creating t-SNE visualization...")
 
         # Get embedding columns
         embedding_cols = [col for col in embeddings_df.columns if col.startswith('embedding_')]
 
-        # Add expert_consensus label from training data if available
-        train_df = pd.read_csv(TRAIN_CSV_PATH)
-        label_map = {}
-        if 'expert_consensus' in train_df.columns:
-            # Create mapping from (eeg_id, eeg_sub_id) to label
-            for _, row in train_df.iterrows():
-                key = (row['eeg_id'], row['eeg_sub_id'])
-                label_map[key] = row['expert_consensus']
-
-            # Add labels to embeddings
-            labels = []
-            for _, row in embeddings_df.iterrows():
-                key = (row['eeg_id'], row['eeg_sub_id'])
-                labels.append(label_map.get(key, 'Unknown'))
-
-            embeddings_df['label'] = labels
+        # Use existing labels if available, otherwise create labels from train.csv
+        if 'expert_consensus' in embeddings_df.columns:
+            labels = embeddings_df['expert_consensus'].values
+            print("Using expert_consensus labels from embeddings dataframe")
         else:
-            # Use EEG ID as label if no expert consensus available
-            embeddings_df['label'] = embeddings_df['eeg_id'].astype(str)
+            # Add expert_consensus label from training data
+            train_df = pd.read_csv(TRAIN_CSV_PATH)
+            label_map = {}
+            if 'expert_consensus' in train_df.columns:
+                # Create mapping from (eeg_id, eeg_sub_id) to label
+                for _, row in train_df.iterrows():
+                    key = (row['eeg_id'], row['eeg_sub_id'])
+                    label_map[key] = row['expert_consensus']
+
+                # Add labels to embeddings
+                labels = []
+                for _, row in embeddings_df.iterrows():
+                    key = (row['eeg_id'], row['eeg_sub_id'])
+                    labels.append(label_map.get(key, 'Unknown'))
+                print("Created expert_consensus labels from train.csv")
+            else:
+                # Use EEG ID as label if no expert consensus available
+                labels = embeddings_df['eeg_id'].astype(str).values
+                print("No expert_consensus found, using eeg_id as labels")
 
         # Select a sample if there are too many points
         if len(embeddings_df) > 1000:
-            sample_df = embeddings_df.sample(1000, random_state=42)
+            # If embeddings_df has 'expert_consensus', stratify sampling by it
+            if 'expert_consensus' in embeddings_df.columns:
+                # Get at least 10 samples per class if possible
+                min_samples = 10
+
+                # Stratified sampling
+                classes = embeddings_df['expert_consensus'].unique()
+                sample_indices = []
+
+                for cls in classes:
+                    cls_indices = embeddings_df[embeddings_df['expert_consensus'] == cls].index
+                    # If we have fewer than min_samples, take all of them
+                    if len(cls_indices) <= min_samples:
+                        sample_indices.extend(cls_indices)
+                    else:
+                        # Otherwise take a sample
+                        n_samples = max(min_samples, int(len(cls_indices) * 1000 / len(embeddings_df)))
+                        sampled = np.random.choice(cls_indices, size=n_samples, replace=False)
+                        sample_indices.extend(sampled)
+
+                # If we have more than 1000 samples, subsample randomly
+                if len(sample_indices) > 1000:
+                    sample_indices = np.random.choice(sample_indices, size=1000, replace=False)
+
+                sample_df = embeddings_df.loc[sample_indices]
+                labels = [labels[i] for i in range(len(labels)) if i in sample_indices]
+            else:
+                sample_df = embeddings_df.sample(1000, random_state=42)
+                # We need to recreate labels for the sampled rows
+                if 'expert_consensus' in embeddings_df.columns:
+                    labels = sample_df['expert_consensus'].values
+                else:
+                    labels = sample_df['eeg_id'].astype(str).values
         else:
             sample_df = embeddings_df
 
-        # Get embeddings and labels
+        # Get embeddings matrix
         X = sample_df[embedding_cols].values
-        labels = sample_df['label'].values
 
         # Perform t-SNE
         tsne = TSNE(n_components=3, random_state=42, perplexity=min(30, len(X) - 1))
@@ -330,9 +374,8 @@ def visualize_subsample_embeddings(embeddings_df, output_dir=OUTPUT_DIR_TEST):
         )
 
         # Save as HTML
-        html_path = os.path.join(output_dir, 'subsample_embeddings_3d.html')
-        fig.write_html(html_path)
-        print(f"3D visualization saved to {html_path}")
+        fig.write_html(out_file)
+        print(f"3D visualization saved to {out_file}")
 
         return fig
 
@@ -351,11 +394,11 @@ def main(test_mode=True, visualize=True):
     """
     # Set file paths based on mode
     if test_mode:
-        output_file = os.path.join(OUTPUT_DIR_TEST, 'subsample_embeddings_test.csv')
-        sample_size = 0.05  # Use 5% of data for testing
+        output_file = VIT_EMBEDDINGS_PATH_TEST
+        sample_size = TEST_SAMPLE_SIZE_VISION  # Use 5% of data for testing
         print(f"Running in TEST MODE with {sample_size * 100:.1f}% of data")
     else:
-        output_file = os.path.join(OUTPUT_DIR_TEST, 'subsample_embeddings.csv')
+        output_file = VIT_EMBEDDINGS_PATH
         sample_size = None
         print("Running in PRODUCTION MODE with full dataset")
 
@@ -381,13 +424,16 @@ def main(test_mode=True, visualize=True):
 
     # Create visualizations if requested
     if visualize and embeddings_df is not None:
-        visualize_subsample_embeddings(embeddings_df)
+        if test_mode:
+            visualize_subsample_embeddings(embeddings_df, out_file=VISION_TSNE_FILE_TEST)
+        else:
+            visualize_subsample_embeddings(embeddings_df, out_file=VISION_TSNE_FILE)
 
     print("Subsample embedding extraction complete!")
     return embeddings_df
 
 
-if __name__ == "__main__":
+def run():
     start_time = time.time()
 
     # Run with test_mode=True for a quick test with 5% of the data
@@ -397,3 +443,7 @@ if __name__ == "__main__":
     elapsed_time = time.time() - start_time
     minutes, seconds = divmod(elapsed_time, 60)
     print(f"Complete process finished in {int(minutes)} minutes {seconds:.2f} seconds")
+
+
+if __name__ == "__main__":
+    run()

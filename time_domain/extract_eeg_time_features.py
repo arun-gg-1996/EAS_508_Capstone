@@ -102,4 +102,4 @@ def main(test_mode=False):
 if __name__ == "__main__":
     # By default, run in test mode
     # Change to main(False) to run on the full dataset
-    main(test_mode=True)
+    main(test_mode=False)

@@ -21,10 +21,6 @@ class EEGWaveletExtractor:
     def __init__(self, wavelet='db4', level=5):
         """
         Initialize the wavelet extractor with specific wavelet parameters
-
-        Parameters:
-            wavelet (str): Wavelet type to use (default: 'db4' - Daubechies 4)
-            level (int): Decomposition level for the wavelet transform (default: 5)
         """
         self.wavelet = wavelet
         self.level = level
@@ -32,13 +28,6 @@ class EEGWaveletExtractor:
     def extract_features(self, eeg_data, fs=SAMPLE_RATE):
         """
         Extract time-frequency domain features from EEG data using wavelet transform
-
-        Parameters:
-            eeg_data (numpy.ndarray): EEG data with shape (samples, channels)
-            fs (int): Sampling frequency in Hz (default 250 Hz)
-
-        Returns:
-            dict: Dictionary of extracted features
         """
         # Initialize features dictionary
         features = {}
@@ -58,18 +47,12 @@ class EEGWaveletExtractor:
             approx_coeffs = coeffs[0]
             detail_coeffs = coeffs[1:]
 
-            # Store length of coefficients for reference when mapping to frequency bands
-            coeff_lengths = [len(c) for c in coeffs]
-
-            # Calculate relative power in each wavelet level (roughly corresponding to frequency bands)
+            # Calculate relative power in each wavelet level
             total_power = np.sum([np.sum(c ** 2) for c in coeffs])
 
             # Add approximate mapping of wavelet levels to frequency bands
-            # This is an approximation as wavelet scales don't directly map to specific frequency bands
             nyquist = fs / 2
             for i, detail in enumerate(detail_coeffs):
-                # Calculate the approximate frequency range for this decomposition level
-                # The highest frequency band is at i=0, lowest at i=level-1
                 level_idx = i + 1  # +1 because detail_coeffs doesn't include the approximation
 
                 # Calculate frequency range for this level
@@ -95,18 +78,7 @@ class EEGWaveletExtractor:
                 features[f"{channel_name}_wavelet_level_{level_idx}_kurt"] = stats.kurtosis(detail)
                 features[f"{channel_name}_wavelet_level_{level_idx}_skew"] = stats.skew(detail)
 
-                # Calculate temporal complexity using entropy measures
-                # Wavelet Energy Entropy
-                if len(detail) > 0:
-                    coef_norm = detail ** 2 / np.sum(detail ** 2) if np.sum(detail ** 2) > 0 else np.zeros_like(detail)
-                    wavelet_entropy = -np.sum(coef_norm * np.log2(coef_norm + 1e-16))
-                    features[f"{channel_name}_wavelet_level_{level_idx}_entropy"] = wavelet_entropy
-                    features[f"{channel_name}_wavelet_{band_name}_entropy"] = wavelet_entropy
-                else:
-                    features[f"{channel_name}_wavelet_level_{level_idx}_entropy"] = 0
-                    features[f"{channel_name}_wavelet_{band_name}_entropy"] = 0
-
-            # Also calculate features for approximation coefficients (lowest frequency band)
+            # Also calculate features for approximation coefficients
             energy_approx = np.sum(approx_coeffs ** 2)
             relative_energy_approx = energy_approx / total_power if total_power > 0 else 0
 
@@ -115,12 +87,9 @@ class EEGWaveletExtractor:
             features[f"{channel_name}_wavelet_approx_mean"] = np.mean(approx_coeffs)
             features[f"{channel_name}_wavelet_approx_std"] = np.std(approx_coeffs)
 
-            # Additional wavelet-specific features
-
-            # 1. Total Wavelet Entropy - overall complexity across all scales
+            # Total Wavelet Entropy
             total_entropy = 0
             for i, detail in enumerate(detail_coeffs):
-                level_idx = i + 1
                 if len(detail) > 0:
                     p_i = np.sum(detail ** 2) / total_power if total_power > 0 else 0
                     if p_i > 0:
@@ -128,30 +97,11 @@ class EEGWaveletExtractor:
 
             features[f"{channel_name}_total_wavelet_entropy"] = total_entropy
 
-            # 2. Wavelet Energy Ratio - ratio of energy in different decomposition levels
-            # Useful for detecting shifts in energy distribution across frequency bands
-            for i in range(len(detail_coeffs) - 1):
-                level_idx1 = i + 1
-                level_idx2 = i + 2
-
-                energy1 = np.sum(detail_coeffs[i] ** 2)
-                energy2 = np.sum(detail_coeffs[i + 1] ** 2)
-
-                ratio = energy1 / energy2 if energy2 > 0 else 0
-                features[f"{channel_name}_wavelet_ratio_L{level_idx1}_L{level_idx2}"] = ratio
-
         return features
 
     def _get_closest_freq_band(self, lower_freq, upper_freq):
         """
         Find the closest traditional frequency band for the given wavelet level frequency range
-
-        Parameters:
-            lower_freq (float): Lower frequency bound of wavelet level
-            upper_freq (float): Upper frequency bound of wavelet level
-
-        Returns:
-            str: Name of the closest traditional frequency band
         """
         # Calculate midpoint of the wavelet level frequency range
         mid_freq = (lower_freq + upper_freq) / 2
@@ -167,7 +117,6 @@ class EEGWaveletExtractor:
         elif mid_freq > self.FREQ_BANDS['gamma'][1]:
             return 'high_gamma'
 
-        # Should not reach here if frequency bands cover the entire spectrum
         return 'unclassified'
 
     def process_example(self, eeg_id, sub_id, data_reader=None, fs=SAMPLE_RATE):
