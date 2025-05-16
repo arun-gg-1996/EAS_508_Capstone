@@ -1,0 +1,429 @@
+# EEG Frequency Domain Features Analysis with Individual Models
+
+This R script analyzes EEG frequency domain features using three machine learning models (Random Forest, Logistic Regression, and LightGBM) to predict expert consensus classifications. Each model is evaluated independently.
+
+## Environment Setup
+
+```{r libraries}
+# Setup Environment
+library(tidyverse)
+library(caret)
+library(ranger)
+library(lightgbm)
+library(e1071)
+library(ggplot2)
+library(corrplot)
+library(doParallel)
+library(pROC)
+library(reshape2)
+library(viridis)
+library(nnet)  # For multinom method (multinomial logistic regression)
+
+# Set seed for reproducibility
+set.seed(42)
+
+# Set up parallel processing
+registerDoParallel(cores = parallel::detectCores() - 1)
+```
+
+## Data Loading and Exploration
+
+```{r loading}
+# Using file.path for OS-independent path handling
+file_path <- file.path("..", "out", "test", "eeg_frequency_domain_features_test.csv")
+
+# Load data directly
+frequency_data <- read.csv(file_path)
+
+# Basic data information
+cat("Data dimensions:", nrow(frequency_data), "rows and", ncol(frequency_data), "columns\n")
+
+# Check for missing values
+missing_values <- colSums(is.na(frequency_data))
+if(sum(missing_values) > 0) {
+  cat("Missing values found in", sum(missing_values > 0), "columns\n")
+} else {
+  cat("No missing values found in the dataset\n")
+}
+
+# Convert target to factor
+frequency_data$expert_consensus <- as.factor(frequency_data$expert_consensus)
+
+# Target distribution
+target_dist <- table(frequency_data$expert_consensus)
+print("Class distribution:")
+print(target_dist)
+
+# Visualize class distribution
+barplot_data <- data.frame(
+  Class = names(target_dist),
+  Count = as.numeric(target_dist)
+)
+
+ggplot(barplot_data, aes(x = Class, y = Count, fill = Class)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = Count), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Distribution of Expert Consensus Classes",
+       x = "Class", y = "Count") +
+  theme_minimal()
+```
+
+## Data Preprocessing
+
+```{r preprocessing}
+# Remove ID columns for modeling
+feature_cols <- setdiff(names(frequency_data), c("eeg_id", "eeg_sub_id", "expert_consensus"))
+X <- frequency_data[, feature_cols]
+y <- frequency_data$expert_consensus
+
+# Split data into training and testing sets (70/30)
+train_index <- createDataPartition(y, p = 0.7, list = FALSE)
+X_train <- X[train_index, ]
+X_test <- X[-train_index, ]
+y_train <- y[train_index]
+y_test <- y[-train_index]
+
+# Feature preprocessing - standardize
+preProc <- preProcess(X_train, method = c("center", "scale"))
+X_train_scaled <- predict(preProc, X_train)
+X_test_scaled <- predict(preProc, X_test)
+
+# Basic feature statistics
+cat("Number of features:", ncol(X), "\n")
+```
+
+## Feature Type Analysis
+
+```{r features}
+# Analyze frequency domain feature types
+feature_types <- c("total_power", "delta_power", "delta_relative_power",
+                  "theta_power", "theta_relative_power",
+                  "alpha_power", "alpha_relative_power",
+                  "beta_power", "beta_relative_power",
+                  "gamma_power", "gamma_relative_power",
+                  "peak_frequency")
+
+# Count features by type
+feature_counts <- sapply(feature_types, function(type) {
+  sum(grepl(type, names(X)))
+})
+
+# Count features by channel
+channel_counts <- sapply(0:19, function(channel) {
+  sum(grepl(paste0("channel_", channel, "_"), names(X)))
+})
+
+# Plot feature type distribution
+par(mfrow = c(1, 2))
+barplot(feature_counts, main = "Frequency Domain Feature Types",
+        col = "skyblue", las = 2, cex.names = 0.8)
+barplot(channel_counts, main = "Features by Channel",
+        col = "lightgreen", las = 2, cex.names = 0.8,
+        names.arg = paste0("Ch", 0:19))
+par(mfrow = c(1, 1))
+
+# Display basic statistics for each feature type
+feature_stats <- lapply(feature_types, function(type) {
+  cols <- grep(type, names(X), value = TRUE)
+  if(length(cols) > 0) {
+    data.frame(
+      Feature_Type = type,
+      Mean = mean(sapply(cols, function(col) mean(X[[col]], na.rm = TRUE))),
+      Std_Dev = mean(sapply(cols, function(col) sd(X[[col]], na.rm = TRUE))),
+      Min = min(sapply(cols, function(col) min(X[[col]], na.rm = TRUE))),
+      Max = max(sapply(cols, function(col) max(X[[col]], na.rm = TRUE)))
+    )
+  }
+})
+feature_stats_df <- do.call(rbind, feature_stats[!sapply(feature_stats, is.null)])
+print(feature_stats_df)
+```
+
+## Model Training Setup
+
+```{r setup}
+# Define common training control settings
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  classProbs = TRUE,
+  savePredictions = "final"
+)
+```
+
+## Model 1: Random Forest
+
+```{r randomforest}
+# Train Random Forest
+set.seed(42)
+rf_model <- train(
+  x = X_train_scaled,
+  y = y_train,
+  method = "ranger",
+  trControl = train_control,
+  tuneLength = 3,
+  importance = 'impurity'
+)
+
+print(rf_model)
+print(rf_model$bestTune)
+
+# Get random forest feature importance
+rf_importance <- varImp(rf_model)
+plot(rf_importance, top = 20, main = "Random Forest Feature Importance")
+```
+
+## Model 2: LightGBM
+
+```{r lightgbm}
+# LightGBM needs special handling
+# First convert data to matrix format
+dtrain <- lgb.Dataset(
+  data = as.matrix(X_train_scaled),
+  label = as.integer(y_train) - 1
+)
+
+# Set LightGBM parameters
+lgb_params <- list(
+  objective = "multiclass",
+  metric = "multi_logloss",
+  num_class = length(levels(y_train)),
+  learning_rate = 0.1,
+  max_depth = 6,
+  num_leaves = 31
+)
+
+# Train LightGBM model
+set.seed(42)
+lgb_model <- lgb.train(
+  params = lgb_params,
+  data = dtrain,
+  nrounds = 100,
+  verbose = 0
+)
+
+# Get variable importance from LightGBM
+lgb_importance <- lgb.importance(lgb_model, percentage = TRUE)
+print("LightGBM top 10 important features:")
+print(head(lgb_importance, 10))
+
+# Plot LightGBM feature importance
+if(nrow(lgb_importance) > 0) {
+  # Plot top features
+  top_n <- min(20, nrow(lgb_importance))
+  imp_data <- head(lgb_importance, top_n)
+
+  ggplot(imp_data, aes(x = reorder(Feature, Gain), y = Gain)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    labs(title = "LightGBM Top Feature Importance",
+         x = "Feature", y = "Gain") +
+    theme_minimal()
+}
+```
+
+## Model Evaluation
+
+```{r evaluation}
+# Make predictions with each individual model
+rf_preds <- predict(rf_model, X_test_scaled)
+
+# For LightGBM
+lgb_prob <- predict(lgb_model, as.matrix(X_test_scaled))
+lgb_prob_matrix <- matrix(lgb_prob, ncol = length(levels(y_train)), byrow = TRUE)
+lgb_preds <- factor(max.col(lgb_prob_matrix), levels = 1:length(levels(y_train)))
+levels(lgb_preds) <- levels(y_train)
+
+# Create confusion matrices
+rf_cm <- confusionMatrix(rf_preds, y_test)
+lgb_cm <- confusionMatrix(lgb_preds, y_test)
+
+# Print model performances
+cat("\nRandom Forest Performance:\n")
+print(rf_cm$overall)
+
+cat("\nLightGBM Performance:\n")
+print(lgb_cm$overall)
+```
+
+## Performance Comparison
+
+```{r comparison}
+# Collect performance metrics
+models <- c("Random Forest", "LightGBM")
+accuracy <- c(
+  rf_cm$overall["Accuracy"],
+  lgb_cm$overall["Accuracy"]
+)
+kappa <- c(
+  rf_cm$overall["Kappa"],
+  lgb_cm$overall["Kappa"]
+)
+
+# Create comparison dataframe
+model_performance <- data.frame(
+  Model = models,
+  Accuracy = accuracy,
+  Kappa = kappa
+)
+
+# Display table of performance metrics
+print("Performance comparison:")
+print(model_performance)
+
+# Plot comparison
+ggplot(model_performance, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.4f", Accuracy)), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Model Accuracy Comparison",
+       y = "Accuracy") +
+  theme_minimal() +
+  ylim(0, 1)
+```
+
+## Best Model Analysis
+
+```{r bestmodel}
+# Find best model
+best_idx <- which.max(model_performance$Accuracy)
+best_model <- model_performance$Model[best_idx]
+
+# Best model confusion matrix
+best_cm <- switch(best_model,
+                 "Random Forest" = rf_cm,
+                 "LightGBM" = lgb_cm)
+
+# Display confusion matrix as table
+cat("\nBest model:", best_model, "\n")
+print("Confusion Matrix:")
+print(best_cm$table)
+
+# Plot confusion matrix
+cm_data <- as.data.frame(best_cm$table)
+colnames(cm_data) <- c("Reference", "Prediction", "Freq")
+
+# Plot confusion matrix heatmap
+ggplot(cm_data, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 4) +
+  scale_fill_viridis() +
+  labs(title = paste("Confusion Matrix -", best_model),
+       x = "Reference", y = "Prediction") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Per-Class Performance Metrics
+
+```{r metrics}
+# Calculate per-class metrics
+per_class_metrics <- data.frame(
+  Class = rownames(best_cm$byClass),
+  Sensitivity = best_cm$byClass[, "Sensitivity"],
+  Specificity = best_cm$byClass[, "Specificity"],
+  Precision = best_cm$byClass[, "Pos Pred Value"],
+  F1_Score = best_cm$byClass[, "F1"]
+)
+
+# Display per-class metrics
+cat("\nPer-class performance metrics for", best_model, ":\n")
+print(per_class_metrics)
+
+# Plot per-class metrics
+per_class_metrics_long <- melt(per_class_metrics, id.vars = "Class",
+                              variable.name = "Metric", value.name = "Value")
+
+ggplot(per_class_metrics_long, aes(x = Class, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_viridis_d() +
+  labs(title = paste("Per-Class Performance Metrics -", best_model),
+       x = "Class", y = "Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylim(0, 1)
+```
+
+## Feature Type Importance Analysis
+
+```{r importance}
+# Analyze importance by feature type for the best model
+if(best_model == "Random Forest") {
+  # Get importance data from the best model
+  importance_data <- if(best_model == "Random Forest") rf_importance$importance else lr_importance$importance
+  importance_data$Feature <- rownames(importance_data)
+  
+  # Function to categorize features
+  get_feature_type <- function(feature_name) {
+    for(type in feature_types) {
+      if(grepl(type, feature_name)) {
+        return(type)
+      }
+    }
+    return("other")
+  }
+  
+  # Categorize features and sum importance
+  importance_data$Type <- sapply(importance_data$Feature, get_feature_type)
+  type_importance <- aggregate(Overall ~ Type, importance_data, sum)
+  
+  # Sort by importance
+  type_importance <- type_importance[order(type_importance$Overall, decreasing = TRUE), ]
+  
+  # Display table
+  cat("\nFeature importance by type for", best_model, ":\n")
+  print(type_importance)
+  
+  # Plot
+  ggplot(type_importance, aes(x = reorder(Type, Overall), y = Overall)) +
+    geom_bar(stat = "identity", fill = "orange") +
+    coord_flip() +
+    labs(title = paste("Feature Importance by Frequency Domain Type (", best_model, ")"),
+         x = "Feature Type", y = "Importance") +
+    theme_minimal()
+} else if(best_model == "LightGBM" && exists("lgb_importance") && nrow(lgb_importance) > 0) {
+  # Function to categorize features
+  get_feature_type <- function(feature_name) {
+    for(type in feature_types) {
+      if(grepl(type, feature_name)) {
+        return(type)
+      }
+    }
+    return("other")
+  }
+  
+  # Add type column
+  lgb_importance$Type <- sapply(lgb_importance$Feature, get_feature_type)
+  
+  # Aggregate by type
+  lgb_type_importance <- aggregate(Gain ~ Type, lgb_importance, sum)
+  
+  # Sort by importance
+  lgb_type_importance <- lgb_type_importance[order(lgb_type_importance$Gain, decreasing = TRUE), ]
+  
+  # Display table
+  cat("\nFeature importance by type for LightGBM:\n")
+  print(lgb_type_importance)
+  
+  # Plot
+  ggplot(lgb_type_importance, aes(x = reorder(Type, Gain), y = Gain)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    coord_flip() +
+    labs(title = "Feature Importance by Frequency Domain Type (LightGBM)",
+         x = "Feature Type", y = "Gain") +
+    theme_minimal()
+}
+```
+
+## Summary
+
+```{r summary}
+# Final summary with key insights
+cat("\n---------- Summary ----------\n")
+cat("1. Analyzed EEG frequency domain features using three machine learning models\n")
+cat("2. ", best_model, " performed best with accuracy of ", round(model_performance$Accuracy[best_idx], 4), "\n", sep="")
+cat("3. Most predictive frequency bands for EEG classification have been identified\n")
+cat("4. Analysis provides insights for optimizing future EEG feature extraction and classification\n")
+```

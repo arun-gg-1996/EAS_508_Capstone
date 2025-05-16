@@ -49,10 +49,9 @@ def extract_all_frequency_features(data_folder=DATA_FOLDER, output_file=FREQ_DOM
             features['eeg_id'] = eeg_id
             features['eeg_sub_id'] = sub_id
 
-            # Add all metadata from the row for reference
-            for col in train_df.columns:
-                if col not in features:
-                    features[col] = row[col]
+            # Add expert_consensus if available
+            if 'expert_consensus' in row:
+                features['expert_consensus'] = row['expert_consensus']
 
             # Append to our collection
             all_features.append(features)
@@ -67,7 +66,7 @@ def extract_all_frequency_features(data_folder=DATA_FOLDER, output_file=FREQ_DOM
     features_df.to_csv(output_file, index=False)
     print(f"Frequency features saved to {output_file}")
 
-    return features_df, train_df.columns
+    return features_df
 
 
 def main(test_mode=True, fs=SAMPLE_RATE):
@@ -83,33 +82,22 @@ def main(test_mode=True, fs=SAMPLE_RATE):
         output_path = FREQ_DOMAIN_OUT_PATH_TEST
         sample_size = TEST_SAMPLE_SIZE_FREQ
         print(f"Running in TEST MODE with {sample_size * 100}% of data")
-        features_df, original_columns = extract_all_frequency_features(
+        features_df = extract_all_frequency_features(
             DATA_FOLDER, output_path, sample=sample_size, fs=fs
         )
     else:
         # Production mode configuration
         output_path = FREQ_DOMAIN_OUT_PATH
         print("Running in PRODUCTION MODE with full dataset")
-        features_df, original_columns = extract_all_frequency_features(
+        features_df = extract_all_frequency_features(
             DATA_FOLDER, output_path, fs=fs
         )
 
-    # Display summary
-    print("\nFrequency domain feature extraction complete.")
-    print(f"Total samples processed: {len(features_df)}")
-    print(f"Total features per sample: {len(features_df.columns) - len(original_columns)}")
+    print(f"Frequency domain feature extraction complete.")
     print(f"Output saved to: {output_path}")
-
-    # Display sample of the extracted features
-    print("\nSample of extracted frequency features:")
-    # Show band power features for the first channel
-    feature_cols = [col for col in features_df.columns
-                    if 'channel_0' in col and any(band in col for band in
-                                                  ['delta', 'theta', 'alpha', 'beta', 'gamma'])][:5]
-    print(features_df[['eeg_id', 'eeg_sub_id', 'expert_consensus'] + feature_cols].head())
 
 
 if __name__ == "__main__":
-    # By default, run in test mode with a sampling frequency of 250 Hz
+    # By default, run in test mode
     # Change to main(False) to run on the full dataset
-    main(test_mode=False, fs=SAMPLE_RATE)
+    main(test_mode=False)

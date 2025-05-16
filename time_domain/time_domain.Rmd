@@ -1,0 +1,967 @@
+---
+title: "EEG Time Domain Features Analysis"
+author: "Data Scientist"
+date: "May 15, 2025"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.width = 10, fig.height = 6)
+```
+
+# 1. Introduction
+
+This analysis explores EEG time domain features to predict expert consensus classifications. We'll implement:
+
+1. Data preprocessing and exploratory analysis of time domain features
+2. Three machine learning models:
+   - LightGBM (gradient boosting)
+   - Random Forest with feature importance
+   - Support Vector Machine with RBF kernel
+3. Performance evaluation including confusion matrices and F1 scores
+
+# 2. Environment Setup
+
+```{r load_libraries}
+# Function to install missing packages
+install_if_missing <- function(packages) {
+  new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+  if(length(new_packages)) {
+    repos <- "https://cloud.r-project.org"
+    install.packages(new_packages, dependencies = TRUE, repos = repos)
+  }
+}
+
+# List of required packages
+required_packages <- c("tidyverse", "caret", "ranger", "lightgbm", "e1071", 
+                      "ggplot2", "corrplot", "doParallel", "pROC", 
+                      "reshape2", "viridis")
+
+# Install missing packages
+install_if_missing(required_packages)
+
+# Load necessary libraries
+library(tidyverse)
+library(caret)
+library(ranger)
+library(lightgbm)
+library(e1071)
+library(ggplot2)
+library(corrplot)
+library(doParallel)
+library(pROC)
+library(reshape2)
+library(viridis)
+
+# Set seed for reproducibility
+set.seed(42)
+
+# Set up parallel processing
+registerDoParallel(cores = parallel::detectCores() - 1)
+```
+
+# 3. Data Loading and Exploration
+
+```{r load_data}
+file_path <- file.path("..", "out", "main", "eeg_time_domain_features.csv")
+
+# Step 1: Read the complete file
+time_domain_data <- read.csv(file_path)
+
+# Step 2: Sample 50% of rows randomly
+set.seed(42)  # For reproducibility
+sampled_rows <- sample(1:nrow(time_domain_data), size = floor(nrow(time_domain_data) * 1))
+time_domain_data <- time_domain_data[sampled_rows, ]
+
+# Print information about the sample
+cat("Sampled", nrow(time_domain_data), "rows (50% of the original dataset)\n")
+
+# Basic data information
+cat("Data dimensions:", nrow(time_domain_data), "rows and", ncol(time_domain_data), "columns\n")
+
+# Structure of data
+str(time_domain_data, list.len = 10)
+
+# Check for missing values
+missing_values <- colSums(is.na(time_domain_data))
+if(sum(missing_values) > 0) {
+  cat("Missing values found in", sum(missing_values > 0), "columns\n")
+} else {
+  cat("No missing values found in the dataset\n")
+}
+
+# Convert target to factor
+time_domain_data$expert_consensus <- as.factor(time_domain_data$expert_consensus)
+
+# Target distribution
+target_dist <- table(time_domain_data$expert_consensus)
+print("Class distribution:")
+print(target_dist)
+```
+
+```{r visualize_target}
+# Visualize class distribution
+barplot_data <- data.frame(
+  Class = names(target_dist),
+  Count = as.numeric(target_dist)
+)
+
+ggplot(barplot_data, aes(x = Class, y = Count, fill = Class)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = Count), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Distribution of Expert Consensus Classes",
+       x = "Class", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# 4. Data Preprocessing and Feature Analysis
+
+```{r preprocess_data}
+# Remove ID columns for modeling
+feature_cols <- setdiff(names(time_domain_data), c("eeg_id", "eeg_sub_id", "expert_consensus"))
+X <- time_domain_data[, feature_cols]
+y <- time_domain_data$expert_consensus
+
+# If we have enough data, split into training and testing sets (70/30)
+if(nrow(time_domain_data) > 10) {
+  set.seed(42)
+  train_index <- createDataPartition(y, p = 0.7, list = FALSE)
+  X_train <- X[train_index, ]
+  X_test <- X[-train_index, ]
+  y_train <- y[train_index]
+  y_test <- y[-train_index]
+} else {
+  # If dataset is too small, use all data for demonstration
+  cat("Dataset too small for splitting, using all data for demonstration\n")
+  X_train <- X
+  X_test <- X
+  y_train <- y
+  y_test <- y
+}
+
+# Feature preprocessing - standardize
+preProc <- preProcess(X_train, method = c("center", "scale"))
+X_train_scaled <- predict(preProc, X_train)
+X_test_scaled <- predict(preProc, X_test)
+
+# Basic feature statistics
+cat("Number of features:", ncol(X), "\n")
+
+# Sample correlation matrix (for a subset of features)
+if(ncol(X) > 30) {
+  set.seed(123)
+  sample_size <- 30
+  sample_features <- sample(names(X), sample_size)
+  corr_matrix <- cor(X_train[, sample_features])
+} else {
+  corr_matrix <- cor(X_train)
+}
+
+# Visualize correlation
+corrplot(corr_matrix, method = "circle", type = "upper", 
+         tl.cex = 0.6, tl.col = "black", tl.srt = 45,
+         title = "Sample Feature Correlation")
+```
+
+```{r feature_types_analysis}
+# Analyze different types of time domain features
+feature_types <- c("mean", "var", "std", "rms", "zcr", "skewness", "kurtosis", 
+                  "hjorth_activity", "hjorth_mobility", "hjorth_complexity")
+
+# Count features by type
+feature_counts <- sapply(feature_types, function(type) {
+  sum(grepl(type, names(X)))
+})
+
+# Count features by channel
+channel_counts <- sapply(0:19, function(channel) {
+  sum(grepl(paste0("channel_", channel, "_"), names(X)))
+})
+
+# Plot feature type distribution
+par(mfrow = c(1, 2))
+barplot(feature_counts, main = "Feature Types", col = "skyblue", 
+        las = 2, cex.names = 0.8)
+barplot(channel_counts, main = "Features by Channel", col = "lightgreen",
+        las = 2, cex.names = 0.8, names.arg = paste0("Ch", 0:19))
+par(mfrow = c(1, 1))
+```
+
+# 5. Model 1: LightGBM with Basic Tuning
+
+```{r lightgbm_setup}
+# Prepare data for LightGBM
+num_classes <- length(levels(y_train))
+y_train_numeric <- as.integer(y_train) - 1  # Convert to 0-based index
+
+# Handle potential errors if dataset is very small
+if(nrow(X_train_scaled) >= 5) {
+  dtrain <- lgb.Dataset(
+    data = as.matrix(X_train_scaled),
+    label = y_train_numeric
+  )
+
+  # Define basic parameters for LightGBM
+  lgb_params <- list(
+    objective = "multiclass",
+    metric = "multi_logloss",
+    num_class = num_classes,
+    verbose = -1,
+    feature_pre_filter = FALSE
+  )
+
+  # Simple parameter options for LightGBM
+  param_sets <- list(
+    list(num_leaves = 31, learning_rate = 0.1, max_depth = 6),
+    list(num_leaves = 63, learning_rate = 0.05, max_depth = 8)
+  )
+
+  # Try to train LightGBM model
+  tryCatch({
+    # Train LightGBM model with best parameters
+    set.seed(42)
+    lgb_model <- lgb.train(
+      params = c(lgb_params, param_sets[[1]]),  # Using first parameter set for simplicity
+      data = dtrain,
+      nrounds = 100,
+      verbose = 0
+    )
+
+    # Feature importance
+    lgb_importance <- lgb.importance(lgb_model, percentage = TRUE)
+    print("Top 10 important features in LightGBM:")
+    print(head(lgb_importance, 10))
+
+    # Make predictions
+    lgb_probs <- predict(lgb_model, as.matrix(X_test_scaled))
+    lgb_prob_matrix <- matrix(lgb_probs, ncol = num_classes, byrow = TRUE)
+    lgb_preds <- max.col(lgb_prob_matrix) - 1  # Get class with highest probability
+    lgb_preds <- factor(lgb_preds, levels = 0:(num_classes-1))  # Convert to factor
+
+    # Convert y_test to same factor levels for comparison
+    y_test_numeric <- as.integer(y_test) - 1
+    y_test_factor <- factor(y_test_numeric, levels = 0:(num_classes-1))
+
+    # Calculate confusion matrix
+    if(length(levels(lgb_preds)) == length(levels(y_test_factor))) {
+      lgb_cm <- confusionMatrix(lgb_preds, y_test_factor)
+      print("LightGBM Performance:")
+      print(lgb_cm$overall)
+    } else {
+      # Handle potential mismatch in predicted classes
+      cat("Warning: Classes in predictions don't match test set classes.\n")
+      cat("LightGBM prediction levels:", levels(lgb_preds), "\n")
+      cat("Test set levels:", levels(y_test_factor), "\n")
+    }
+  }, error = function(e) {
+    cat("Error in LightGBM:", e$message, "\n")
+    cat("Skipping LightGBM due to error.\n")
+  })
+} else {
+  cat("Dataset too small for LightGBM. Skipping this model.\n")
+}
+```
+
+# 6. Model 2: Random Forest
+
+```{r rf_setup}
+# Try to train Random Forest with error handling
+tryCatch({
+  set.seed(42)
+  rf_model <- ranger(
+    formula = y_train ~ .,
+    data = data.frame(X_train_scaled, y_train = y_train),
+    num.trees = 500,
+    importance = 'impurity',
+    probability = TRUE
+  )
+
+  # Feature importance
+  rf_importance <- data.frame(
+    Feature = names(X_train),
+    Importance = rf_model$variable.importance
+  )
+  rf_importance <- rf_importance[order(rf_importance$Importance, decreasing = TRUE), ]
+
+  print("Top 10 important features in Random Forest:")
+  print(head(rf_importance, 10))
+
+  # Make predictions
+  rf_preds_prob <- predict(rf_model, data = X_test_scaled)$predictions
+  rf_preds <- factor(max.col(rf_preds_prob) - 1, levels = 0:(num_classes-1))
+
+  # Calculate confusion matrix
+  if(length(levels(rf_preds)) == length(levels(y_test_factor))) {
+    rf_cm <- confusionMatrix(rf_preds, y_test_factor)
+    print("Random Forest Performance:")
+    print(rf_cm$overall)
+  } else {
+    # Handle potential mismatch
+    cat("Warning: Classes in predictions don't match test set classes.\n")
+    cat("Random Forest prediction levels:", levels(rf_preds), "\n")
+    cat("Test set levels:", levels(y_test_factor), "\n")
+  }
+}, error = function(e) {
+  cat("Error in Random Forest:", e$message, "\n")
+  cat("Skipping Random Forest due to error. This could be due to small dataset size.\n")
+})
+```
+
+# 7. Model 3: Logistic Regression
+
+```{r logistic_regression_setup}
+# Try to train Logistic Regression with robust error handling
+tryCatch({
+  # First, make sure data is properly prepared
+  X_train_matrix <- as.matrix(X_train_scaled)
+  X_train_matrix[!is.finite(X_train_matrix)] <- 0
+  X_test_matrix <- as.matrix(X_test_scaled)
+  X_test_matrix[!is.finite(X_test_matrix)] <- 0
+  
+  # Apply PCA if data has many features to avoid overfitting in logistic regression
+  if(ncol(X_train_matrix) > 50) {
+    pca_result <- prcomp(X_train_matrix, center = TRUE, scale. = FALSE)
+    variance_explained <- cumsum(pca_result$sdev^2)/sum(pca_result$sdev^2)
+    
+    # Find number of components for 95% variance or use at most 30
+    if(any(variance_explained >= 0.95)) {
+      n_components <- min(which(variance_explained >= 0.95))
+    } else {
+      n_components <- min(30, length(variance_explained))
+    }
+    
+    cat("Using", n_components, "PCA components for Logistic Regression\n")
+    
+    # Transform data
+    X_train_for_lr <- predict(pca_result, X_train_matrix)[, 1:n_components]
+    X_test_for_lr <- predict(pca_result, X_test_matrix)[, 1:n_components]
+    
+    # Prepare data frames for model training
+    train_data_lr <- data.frame(X_train_for_lr)
+    train_data_lr$y_train <- y_train
+    
+    test_data_lr <- data.frame(X_test_for_lr)
+  } else {
+    # Use the cleaned data directly if fewer features
+    train_data_lr <- data.frame(X_train_matrix)
+    train_data_lr$y_train <- y_train
+    
+    test_data_lr <- data.frame(X_test_matrix)
+  }
+  
+  # Train logistic regression - using caret for consistency with other models
+  set.seed(42)
+  
+  # multiclass logistic regression via caret
+  lr_model <- train(
+    y_train ~ ., 
+    data = train_data_lr,
+    method = "multinom",  # Multinomial logistic regression
+    trControl = trainControl(
+      method = "cv",
+      number = 5,
+      verboseIter = FALSE
+    ),
+    trace = FALSE  # Suppress convergence messages
+  )
+  
+  # Make predictions
+  lr_preds <- predict(lr_model, newdata = test_data_lr)
+  
+  # Calculate confusion matrix
+  lr_cm <- confusionMatrix(lr_preds, y_test)
+  print("Logistic Regression Performance:")
+  print(lr_cm$overall)
+  
+  # Get variable importance if possible
+  if("varImp" %in% methods(class(lr_model))) {
+    lr_importance <- varImp(lr_model)
+    print("Top 10 important features in Logistic Regression:")
+    print(head(lr_importance$importance, 10))
+  }
+  
+}, error = function(e) {
+  cat("Error in Logistic Regression:", e$message, "\n")
+  
+  # Try a simpler approach as fallback
+  cat("Trying simpler Logistic Regression as fallback...\n")
+  
+  tryCatch({
+    # Use glmnet for regularized logistic regression (handles many features better)
+    required_packages <- c("glmnet")
+    install_if_missing(required_packages)
+    library(glmnet)
+    
+    # Prepare data for glmnet
+    x_train_simple <- as.matrix(X_train_scaled)
+    x_test_simple <- as.matrix(X_test_scaled)
+    y_train_simple <- as.numeric(y_train) - 1  # Convert to 0-based numeric
+    
+    # Train model with cross-validation for lambda selection
+    cv_fit <- cv.glmnet(
+      x = x_train_simple,
+      y = y_train_simple,
+      family = "multinomial",
+      alpha = 0.5,  # Elastic net (mix of L1 and L2 regularization)
+      type.measure = "class"
+    )
+    
+    # Select model with best lambda
+    lr_simple <- glmnet(
+      x = x_train_simple,
+      y = y_train_simple,
+      family = "multinomial",
+      alpha = 0.5,
+      lambda = cv_fit$lambda.min
+    )
+    
+    # Make predictions
+    lr_probs <- predict(lr_simple, newx = x_test_simple, type = "response")[,,1]
+    lr_pred_class <- apply(lr_probs, 1, which.max) - 1  # Adjust for 0-based indexing
+    lr_preds <- factor(lr_pred_class, levels = unique(as.numeric(y_test) - 1))
+    
+    # Convert y_test to numeric for confusion matrix
+    y_test_numeric <- as.numeric(y_test) - 1
+    y_test_factor <- factor(y_test_numeric, levels = unique(y_test_numeric))
+    
+    # Calculate confusion matrix
+    lr_cm <<- confusionMatrix(lr_preds, y_test_factor)
+    print("Simple Logistic Regression Performance:")
+    print(lr_cm$overall)
+    
+  }, error = function(e2) {
+    cat("Error in simple Logistic Regression too:", e2$message, "\n")
+    cat("Skipping Logistic Regression analysis completely.\n")
+  })
+})
+```
+
+# 8. Model Comparison and Feature Analysis
+
+```{r model_comparison}
+# Collect performance metrics from models that ran successfully
+model_metrics <- data.frame(
+  Model = character(),
+  Accuracy = numeric(),
+  Kappa = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Add metrics if models ran successfully
+if(exists("lgb_cm")) {
+  model_metrics <- rbind(model_metrics, 
+                         data.frame(Model = "LightGBM", 
+                                   Accuracy = lgb_cm$overall["Accuracy"],
+                                   Kappa = lgb_cm$overall["Kappa"]))
+}
+
+if(exists("rf_cm")) {
+  model_metrics <- rbind(model_metrics, 
+                         data.frame(Model = "Random Forest", 
+                                   Accuracy = rf_cm$overall["Accuracy"],
+                                   Kappa = rf_cm$overall["Kappa"]))
+}
+
+if(exists("lr_cm")) {
+  model_metrics <- rbind(model_metrics, 
+                         data.frame(Model = "Logistic Regression", 
+                                   Accuracy = lr_cm$overall["Accuracy"],
+                                   Kappa = lr_cm$overall["Kappa"]))
+}
+
+# Plot comparison if we have results
+if(nrow(model_metrics) > 0) {
+  print("Model Performance Comparison:")
+  print(model_metrics)
+  
+  ggplot(model_metrics, aes(x = Model, y = Accuracy, fill = Model)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = sprintf("%.4f", Accuracy)), vjust = -0.5) +
+    scale_fill_viridis_d() +
+    labs(title = "Model Accuracy Comparison",
+         y = "Accuracy") +
+    theme_minimal() +
+    ylim(0, 1)
+} else {
+  cat("No model comparisons available - all models failed to run.\n")
+}
+```
+
+```{r feature_importance_analysis}
+# Analyze feature importance from any model that ran successfully
+if(exists("lgb_importance")) {
+  # Plot top features
+  top_n <- min(20, nrow(lgb_importance))
+  imp_data <- head(lgb_importance, top_n)
+  
+  ggplot(imp_data, aes(x = reorder(Feature, Gain), y = Gain)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    labs(title = "LightGBM Top Feature Importance",
+         x = "Feature", y = "Gain") +
+    theme_minimal()
+} else if(exists("rf_importance")) {
+  # Plot RF importance
+  top_n <- min(20, nrow(rf_importance))
+  imp_data <- head(rf_importance, top_n)
+  
+  ggplot(imp_data, aes(x = reorder(Feature, Importance), y = Importance)) +
+    geom_bar(stat = "identity", fill = "forestgreen") +
+    coord_flip() +
+    labs(title = "Random Forest Top Feature Importance",
+         x = "Feature", y = "Importance") +
+    theme_minimal()
+} else if(exists("lr_importance")) {
+  # Plot LR importance if available
+  importance_data <- lr_importance$importance
+  importance_data$Feature <- rownames(importance_data)
+  top_n <- min(20, nrow(importance_data))
+  imp_data <- head(importance_data[order(importance_data$Overall, decreasing = TRUE),], top_n)
+  
+  ggplot(imp_data, aes(x = reorder(Feature, Overall), y = Overall)) +
+    geom_bar(stat = "identity", fill = "coral") +
+    coord_flip() +
+    labs(title = "Logistic Regression Top Feature Importance",
+         x = "Feature", y = "Importance") +
+    theme_minimal()
+} else {
+  cat("No feature importance plots available - required models failed to run.\n")
+}
+
+# Fixed function for analyzing feature types
+analyze_feature_types <- function() {
+  # Only run if we have feature importance
+  if(!exists("lgb_importance") && !exists("rf_importance") && !exists("lr_importance")) {
+    return(cat("No feature importance data available.\n"))
+  }
+  
+  # Use whichever importance data is available
+  if(exists("lgb_importance")) {
+    imp_df <- lgb_importance
+    importance_col <- "Gain"
+    imp_column_name <- "Gain"
+  } else if(exists("rf_importance")) {
+    imp_df <- rf_importance
+    importance_col <- "Importance"
+    imp_column_name <- "Importance"
+  } else if(exists("lr_importance")) {
+    # For logistic regression, we need to handle the importance data differently
+    importance_data <- lr_importance$importance
+    importance_data$Feature <- rownames(importance_data)
+    imp_df <- importance_data
+    importance_col <- "Overall"
+    imp_column_name <- "Overall"
+  }
+  
+  # Convert importance_col from variable to actual column name
+  imp_df_standard <- as.data.frame(imp_df)
+  
+  # Extract feature type from name
+  feature_types <- c("mean", "var", "std", "rms", "zcr", "skewness", "kurtosis", 
+                    "hjorth_activity", "hjorth_mobility", "hjorth_complexity")
+  
+  type_importance <- sapply(feature_types, function(type) {
+    type_features <- grep(type, imp_df_standard$Feature, value = TRUE)
+    if(length(type_features) == 0) return(0)
+    
+    # Use standard data frame subsetting to avoid data.table issues
+    matched_rows <- imp_df_standard$Feature %in% type_features
+    return(sum(imp_df_standard[[imp_column_name]][matched_rows], na.rm = TRUE))
+  })
+  
+  # Create data frame for plotting
+  type_df <- data.frame(
+    Type = feature_types,
+    Importance = type_importance
+  )
+  
+  # Sort by importance
+  type_df <- type_df[order(type_df$Importance, decreasing = TRUE), ]
+  
+  # Plot
+  ggplot(type_df, aes(x = reorder(Type, Importance), y = Importance)) +
+    geom_bar(stat = "identity", fill = "orange") +
+    coord_flip() +
+    labs(title = "Importance by Feature Type",
+         x = "Feature Type", y = "Total Importance") +
+    theme_minimal()
+}
+
+# Run the feature type analysis
+analyze_feature_types()
+```
+
+# 9. Conclusion
+
+```{r conclusion}
+# Find best model if we have results
+if(nrow(model_metrics) > 0) {
+  best_idx <- which.max(model_metrics$Accuracy)
+  best_model <- model_metrics$Model[best_idx]
+  
+  cat("Best performing model:", best_model, "\n")
+  cat("Accuracy:", model_metrics$Accuracy[best_idx], "\n")
+  cat("Kappa:", model_metrics$Kappa[best_idx], "\n")
+  
+  # Key findings from the analysis
+  cat("\nKey Findings:\n")
+  cat("1. The time domain EEG features show predictive power for classification\n")
+  
+  # List important features if available
+  if(exists("lgb_importance")) {
+    cat("2. Most important features from LightGBM:\n")
+    cat("   - ", paste(head(lgb_importance$Feature, 5), collapse = "\n   - "), "\n")
+  } else if(exists("rf_importance")) {
+    cat("2. Most important features from Random Forest:\n")
+    cat("   - ", paste(head(rf_importance$Feature, 5), collapse = "\n   - "), "\n")
+  } else if(exists("lr_importance")) {
+    # Extract top features from lr_importance
+    importance_data <- lr_importance$importance
+    importance_data$Feature <- rownames(importance_data)
+    top_features <- head(importance_data[order(importance_data$Overall, decreasing = TRUE),], 5)
+    
+    cat("2. Most important features from Logistic Regression:\n")
+    cat("   - ", paste(top_features$Feature, collapse = "\n   - "), "\n")
+  }
+  
+  cat("3. Recommendation: ", best_model, " performed best and should be considered for production use\n")
+} else {
+  cat("Unable to determine the best model as no models completed successfully.\n")
+  cat("This could be due to the small dataset size or other data quality issues.\n")
+  cat("Recommendations:\n")
+  cat("1. Acquire more training data\n")
+  cat("2. Try different preprocessing techniques\n")
+  cat("3. Consider simpler models with fewer parameters\n")
+}
+
+# Next steps
+cat("\nNext Steps:\n")
+cat("1. Try combining time domain features with wavelet domain features\n")
+cat("2. Experiment with additional feature selection techniques\n")
+cat("3. Consider expanding the dataset with more examples\n")
+cat("4. Explore deep learning approaches for EEG classification\n")
+```
+
+# 10. Detailed Performance Metrics and Evaluation
+
+```{r detailed_metrics}
+# Calculate additional performance metrics for all models
+calculate_detailed_metrics <- function(predictions, actual, model_name) {
+  # Ensure both are factors with same levels
+  if(is.factor(predictions) && is.factor(actual)) {
+    if(!identical(levels(predictions), levels(actual))) {
+      common_levels <- intersect(levels(predictions), levels(actual))
+      predictions <- factor(predictions, levels = common_levels)
+      actual <- factor(actual, levels = common_levels)
+    }
+  }
+  
+  # Get confusion matrix
+  cm <- confusionMatrix(predictions, actual)
+  
+  # Get class-specific metrics
+  metrics_by_class <- cm$byClass
+  
+  # Calculate F1 score, precision, recall
+  if(is.matrix(metrics_by_class)) {
+    f1_scores <- metrics_by_class[, "F1"]
+    precision_scores <- metrics_by_class[, "Precision"]
+    recall_scores <- metrics_by_class[, "Recall"]
+    
+    # Calculate means across classes
+    mean_f1 <- mean(f1_scores, na.rm = TRUE)
+    mean_precision <- mean(precision_scores, na.rm = TRUE)
+    mean_recall <- mean(recall_scores, na.rm = TRUE)
+  } else {
+    f1_scores <- metrics_by_class["F1"]
+    precision_scores <- metrics_by_class["Precision"]
+    recall_scores <- metrics_by_class["Recall"]
+    
+    mean_f1 <- f1_scores
+    mean_precision <- precision_scores
+    mean_recall <- recall_scores
+  }
+  
+  # Return detailed metrics
+  return(list(
+    model = model_name,
+    confusion_matrix = cm$table,
+    accuracy = cm$overall["Accuracy"],
+    kappa = cm$overall["Kappa"],
+    f1_scores = f1_scores,
+    precision_scores = precision_scores,
+    recall_scores = recall_scores,
+    mean_f1 = mean_f1,
+    mean_precision = mean_precision,
+    mean_recall = mean_recall
+  ))
+}
+
+# Fixed safer version of KL divergence function
+calculate_kl_divergence <- function(probs, actual_classes, num_classes) {
+  # Safety check - make sure actual_classes are 0-based numeric
+  if(is.factor(actual_classes)) {
+    actual_numeric <- as.numeric(actual_classes) - 1
+  } else {
+    actual_numeric <- as.numeric(actual_classes)
+  }
+  
+  # Ensure actual class values are within valid range [0, num_classes-1]
+  if(min(actual_numeric) < 0 || max(actual_numeric) >= num_classes) {
+    # Remap classes to ensure they are in [0, num_classes-1]
+    unique_classes <- sort(unique(actual_numeric))
+    class_map <- setNames(0:(length(unique_classes)-1), as.character(unique_classes))
+    actual_numeric <- as.numeric(class_map[as.character(actual_numeric)])
+    
+    # Adjust num_classes if needed
+    num_classes <- length(unique_classes)
+  }
+  
+  # Convert actual classes to one-hot encoding
+  actual_one_hot <- matrix(0, nrow = length(actual_numeric), ncol = num_classes)
+  for(i in 1:length(actual_numeric)) {
+    idx <- actual_numeric[i] + 1
+    if(idx >= 1 && idx <= num_classes) {
+      actual_one_hot[i, idx] <- 1
+    } else {
+      # Fallback for any out-of-bounds indices
+      warning(paste("Class index out of bounds:", actual_numeric[i], 
+                    "with num_classes =", num_classes))
+      # Put 1 in the first position as a fallback
+      actual_one_hot[i, 1] <- 1
+    }
+  }
+  
+  # Ensure probability matrix has right dimensions
+  if(ncol(probs) != num_classes) {
+    warning(paste("Probability matrix columns (", ncol(probs), 
+                 ") don't match number of classes (", num_classes, ")", sep=""))
+    # Try to adjust
+    if(ncol(probs) > num_classes) {
+      probs <- probs[, 1:num_classes]
+    } else {
+      # Fill missing columns with zeros
+      missing_cols <- num_classes - ncol(probs)
+      probs <- cbind(probs, matrix(0, nrow = nrow(probs), ncol = missing_cols))
+    }
+  }
+  
+  # Make sure probabilities are proper (sum to 1 for each row)
+  probs <- sweep(probs, 1, rowSums(probs), "/")
+  
+  # Add small epsilon to avoid log(0)
+  epsilon <- 1e-10
+  probs <- pmax(probs, epsilon)
+  probs <- sweep(probs, 1, rowSums(probs), "/")
+  
+  # Calculate KL divergence for each sample
+  kl_div <- rowSums(actual_one_hot * log((actual_one_hot + epsilon) / probs), na.rm = TRUE)
+  
+  # Return mean KL divergence
+  return(mean(kl_div, na.rm = TRUE))
+}
+
+# Collect all metrics
+all_metrics <- list()
+
+# Calculate metrics for LightGBM if it ran successfully
+if(exists("lgb_preds") && exists("lgb_prob_matrix")) {
+  lgb_metrics <- calculate_detailed_metrics(lgb_preds, y_test_factor, "LightGBM")
+  
+  # Safely calculate KL divergence or skip if it fails
+  tryCatch({
+    lgb_kl_div <- calculate_kl_divergence(lgb_prob_matrix, as.numeric(y_test_factor), num_classes)
+    lgb_metrics$kl_divergence <- lgb_kl_div
+  }, error = function(e) {
+    warning(paste("Could not calculate KL divergence for LightGBM:", e$message))
+  })
+  
+  all_metrics[["LightGBM"]] <- lgb_metrics
+}
+
+# Calculate metrics for Random Forest if it ran successfully
+if(exists("rf_preds") && exists("rf_preds_prob")) {
+  rf_metrics <- calculate_detailed_metrics(rf_preds, y_test_factor, "Random Forest")
+  
+  # Safely calculate KL divergence or skip if it fails
+  tryCatch({
+    rf_kl_div <- calculate_kl_divergence(rf_preds_prob, as.numeric(y_test_factor), num_classes)
+    rf_metrics$kl_divergence <- rf_kl_div
+  }, error = function(e) {
+    warning(paste("Could not calculate KL divergence for Random Forest:", e$message))
+  })
+  
+  all_metrics[["Random Forest"]] <- rf_metrics
+}
+
+# Calculate metrics for Logistic Regression if it ran successfully
+if(exists("lr_preds")) {
+  # Calculate basic metrics regardless of probability availability
+  lr_metrics <- calculate_detailed_metrics(lr_preds, y_test, "Logistic Regression")
+  
+  # Check if we can obtain probability predictions - fixed check
+  has_predict_method <- FALSE
+  if(exists("lr_model")) {
+    # Safer way to check for predict method
+    tryCatch({
+      if("predict" %in% methods(class = class(lr_model)[1])) {
+        has_predict_method <- TRUE
+      }
+    }, error = function(e) {
+      warning("Could not check methods for lr_model")
+    })
+  }
+  
+  # Try to get probability predictions if method exists
+  if(has_predict_method) {
+    tryCatch({
+      lr_probs <- predict(lr_model, newdata = test_data_lr, type = "prob")
+      lr_prob_matrix <- as.matrix(lr_probs)
+      
+      # Get correct class indices
+      lr_classes <- as.numeric(y_test) - 1
+      
+      # Calculate KL divergence
+      lr_kl_div <- calculate_kl_divergence(lr_prob_matrix, lr_classes, num_classes)
+      lr_metrics$kl_divergence <- lr_kl_div
+    }, error = function(e) {
+      warning(paste("Could not calculate KL divergence for Logistic Regression:", e$message))
+    })
+  }
+  
+  all_metrics[["Logistic Regression"]] <- lr_metrics
+}
+
+# Create a comparison table of all metrics
+metrics_comparison <- data.frame(
+  Model = character(),
+  Accuracy = numeric(),
+  Kappa = numeric(),
+  F1_Score = numeric(),
+  Precision = numeric(),
+  Recall = numeric(),
+  KL_Divergence = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for(model_name in names(all_metrics)) {
+  metrics <- all_metrics[[model_name]]
+  
+  metrics_row <- data.frame(
+    Model = model_name,
+    Accuracy = metrics$accuracy,
+    Kappa = metrics$kappa,
+    F1_Score = metrics$mean_f1,
+    Precision = metrics$mean_precision,
+    Recall = metrics$mean_recall,
+    KL_Divergence = ifelse(is.null(metrics$kl_divergence), NA, metrics$kl_divergence),
+    stringsAsFactors = FALSE
+  )
+  
+  metrics_comparison <- rbind(metrics_comparison, metrics_row)
+}
+
+# Display the metrics comparison
+print("Comprehensive Model Performance Comparison:")
+print(metrics_comparison)
+```
+```{r}
+# Find the best model
+if(nrow(metrics_comparison) > 0) {
+  # Find best model based on accuracy
+  best_idx <- which.max(metrics_comparison$Accuracy)
+  best_model_name <- metrics_comparison$Model[best_idx]
+  
+  cat("Displaying detailed confusion matrix for best model:", best_model_name, "\n")
+  cat("Accuracy:", metrics_comparison$Accuracy[best_idx], "\n")
+  
+  # Get confusion matrix for best model
+  if(best_model_name %in% names(all_metrics)) {
+    best_conf_matrix <- all_metrics[[best_model_name]]$confusion_matrix
+    
+    # Convert to data frame for visualization
+    conf_df <- as.data.frame(as.table(best_conf_matrix))
+    names(conf_df) <- c("Actual", "Predicted", "Frequency")
+    
+    # Calculate row and column totals
+    row_totals <- aggregate(Frequency ~ Actual, data = conf_df, sum)
+    col_totals <- aggregate(Frequency ~ Predicted, data = conf_df, sum)
+    
+    # Calculate percentages
+    conf_df <- merge(conf_df, row_totals, by = "Actual", suffixes = c("", "_total"))
+    conf_df$Row_Percent <- conf_df$Frequency / conf_df$Frequency_total * 100
+    
+    # Create a more detailed confusion matrix plot
+    cm_plot <- ggplot(conf_df, aes(x = Predicted, y = Actual)) +
+      geom_tile(aes(fill = Row_Percent), color = "white") +
+      geom_text(aes(label = sprintf("%d\n(%.1f%%)", Frequency, Row_Percent)), 
+                color = ifelse(conf_df$Row_Percent > 50, "white", "black"), 
+                size = 4, fontface = "bold") +
+      scale_fill_gradient(low = "white", high = "steelblue", 
+                         name = "% of Actual Class") +
+      labs(title = paste(best_model_name, "Confusion Matrix"),
+           subtitle = paste("Overall Accuracy:", 
+                          round(metrics_comparison$Accuracy[best_idx]*100, 2), "%"),
+           x = "Predicted Class", 
+           y = "Actual Class") +
+      theme_minimal() +
+      theme(axis.text = element_text(size = 12),
+            axis.title = element_text(size = 14),
+            plot.title = element_text(size = 16, face = "bold"),
+            plot.subtitle = element_text(size = 12),
+            panel.grid.major = element_blank(),
+            panel.grid.minor = element_blank())
+    
+    # Display the plot
+    print(cm_plot)
+    
+    # Calculate additional metrics for each class
+    class_metrics <- data.frame(
+      Class = names(all_metrics[[best_model_name]]$f1_scores),
+      F1_Score = as.numeric(all_metrics[[best_model_name]]$f1_scores),
+      Precision = as.numeric(all_metrics[[best_model_name]]$precision_scores),
+      Recall = as.numeric(all_metrics[[best_model_name]]$recall_scores)
+    )
+    
+    # Print class-specific metrics
+    cat("\nClass-specific metrics for", best_model_name, ":\n")
+    print(class_metrics)
+    
+    # Visualize class-specific metrics
+    metrics_long <- reshape2::melt(class_metrics, 
+                                 id.vars = "Class", 
+                                 variable.name = "Metric", 
+                                 value.name = "Value")
+    
+    metrics_plot <- ggplot(metrics_long, aes(x = Class, y = Value, fill = Metric)) +
+      geom_bar(stat = "identity", position = position_dodge()) +
+      geom_text(aes(label = sprintf("%.3f", Value)), 
+                position = position_dodge(width = 0.9), 
+                vjust = -0.5, size = 3) +
+      scale_fill_manual(values = c("F1_Score" = "steelblue", 
+                                  "Precision" = "darkgreen", 
+                                  "Recall" = "darkorange")) +
+      labs(title = paste(best_model_name, "Performance by Class"),
+           x = "Class", y = "Score") +
+      theme_minimal() +
+      ylim(0, 1)
+    
+    print(metrics_plot)
+    
+  } else {
+    cat("Error: Confusion matrix data not found for best model\n")
+  }
+} else {
+  cat("No models available for comparison\n")
+}
+```
+

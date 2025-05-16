@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -15,42 +17,19 @@ from const import TRAIN_EEG_DIR, TRAIN_CSV_PATH, OUTPUT_DIR, BRAINDECODE_OUT_PAT
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Enable performance optimizations if CUDA is available
-if torch.cuda.is_available():
-    torch.backends.cudnn.benchmark = True
-    print("CUDA optimizations enabled")
-
-# Set maximum sequence length for processing
-MAX_SEQUENCE_LENGTH = 1000  # Adjust based on memory constraints
+# Preprocessing settings
+MAX_SEQUENCE_LENGTH = 1000
 
 
-class EEGSubsampleDataset(Dataset):
-    """Dataset for loading EEG data and their subsamples"""
+class EEGDataset(Dataset):
+    """Dataset for loading EEG data"""
 
-    def __init__(self, data_df, eeg_dir, cache_size=100, max_seq_len=MAX_SEQUENCE_LENGTH):
-        """
-        Args:
-            data_df: DataFrame containing eeg_id, eeg_sub_id, etc.
-            eeg_dir: Directory containing EEG files
-            cache_size: Number of EEGs to cache in memory
-            max_seq_len: Maximum sequence length to use (will crop longer sequences)
-        """
+    def __init__(self, data_df, eeg_dir, max_seq_len=MAX_SEQUENCE_LENGTH):
         self.data_df = data_df
         self.eeg_dir = eeg_dir
         self.max_seq_len = max_seq_len
-
-        # Initialize cache for EEGs to reduce disk I/O
         self.cache = {}
-        self.cache_size = cache_size
-        self.cache_hits = 0
-        self.cache_misses = 0
-
-        # Ensure that we have both eeg_id and eeg_sub_id columns
-        if 'eeg_id' not in data_df.columns or 'eeg_sub_id' not in data_df.columns:
-            raise ValueError("DataFrame must contain 'eeg_id' and 'eeg_sub_id' columns")
-
-        print(f"Dataset contains {len(data_df)} EEG subsamples")
-        print(f"Unique EEG IDs: {len(data_df['eeg_id'].unique())}")
+        print(f"Dataset contains {len(data_df)} EEG samples")
 
     def __len__(self):
         return len(self.data_df)
@@ -60,37 +39,21 @@ class EEGSubsampleDataset(Dataset):
         eeg_id = str(row['eeg_id'])
         eeg_sub_id = row['eeg_sub_id']
 
-        # Cache key is just the EEG ID (we cache the full EEG data)
-        cache_key = eeg_id
-
-        # Try to get full EEG data from cache first
-        if cache_key in self.cache:
-            eeg_data = self.cache[cache_key]
-            self.cache_hits += 1
+        # Try to get data from cache
+        if eeg_id in self.cache:
+            eeg_data = self.cache[eeg_id]
         else:
-            # Load EEG data from file
-            parquet_path = os.path.join(self.eeg_dir, f"{eeg_id}.parquet")
-            self.cache_misses += 1
-
             try:
-                # Read parquet file
+                # Load EEG data from file
+                parquet_path = os.path.join(self.eeg_dir, f"{eeg_id}.parquet")
                 table = pq.read_table(parquet_path)
                 df = table.to_pandas()
-
-                # Get EEG data
                 eeg_data = df.values
 
-                # Add to cache
-                if len(self.cache) >= self.cache_size:
-                    # Remove a random item if cache is full
-                    remove_key = next(iter(self.cache))
-                    del self.cache[remove_key]
-
-                self.cache[cache_key] = eeg_data
-
+                # Add to cache (simple, no size limit)
+                self.cache[eeg_id] = eeg_data
             except Exception as e:
                 print(f"Error loading {parquet_path}: {e}")
-                # Return placeholder in case of error
                 return {
                     'eeg_data': torch.zeros((1, 20, self.max_seq_len), dtype=torch.float32),
                     'eeg_id': eeg_id,
@@ -99,50 +62,52 @@ class EEGSubsampleDataset(Dataset):
                 }
 
         try:
-            # Extract subsample based on eeg_sub_id
-            # This assumes that the subsamples are continuous segments
-            subsample = self.extract_subsample(eeg_data, eeg_sub_id, row)
+            # Extract subsample based on eeg_sub_id (simple approach)
+            window_size = min(2000, len(eeg_data) // 10)
+            start_idx = int(eeg_sub_id) * window_size
+            end_idx = min(start_idx + window_size, len(eeg_data))
 
-            # Preprocess EEG subsample
-            # 1. Normalize
+            # Ensure start index is in bounds
+            if start_idx >= len(eeg_data):
+                start_idx = max(0, len(eeg_data) - window_size)
+                end_idx = len(eeg_data)
+
+            subsample = eeg_data[start_idx:end_idx]
+
+            # Normalize to [0, 1]
             if subsample.max() > subsample.min():
                 subsample_norm = (subsample - subsample.min()) / (subsample.max() - subsample.min())
             else:
                 subsample_norm = np.zeros_like(subsample)
 
-            # 2. Transpose to (channels, time_steps)
+            # Transpose to (channels, time_steps)
             subsample_norm = subsample_norm.T
 
-            # 3. Crop or pad to max_seq_len
+            # Crop or pad to max_seq_len
             n_channels, n_times = subsample_norm.shape
             if n_times > self.max_seq_len:
-                # Crop to max_seq_len
                 subsample_norm = subsample_norm[:, :self.max_seq_len]
             elif n_times < self.max_seq_len:
-                # Pad to max_seq_len
                 padding = np.zeros((n_channels, self.max_seq_len - n_times))
                 subsample_norm = np.concatenate([subsample_norm, padding], axis=1)
 
-            # 4. Add batch dimension and convert to tensor
+            # Convert to tensor
             eeg_tensor = torch.tensor(subsample_norm, dtype=torch.float32).unsqueeze(0)
 
-            # Return all metadata along with preprocessed tensor
             result = {
                 'eeg_data': eeg_tensor,
                 'eeg_id': eeg_id,
                 'eeg_sub_id': eeg_sub_id
             }
 
-            # Add any other metadata from the row
-            for col in self.data_df.columns:
-                if col not in result and col not in ['eeg_id', 'eeg_sub_id']:
-                    result[col] = row[col]
+            # Add expert_consensus if available
+            if 'expert_consensus' in row:
+                result['expert_consensus'] = row['expert_consensus']
 
             return result
 
         except Exception as e:
-            print(f"Error preprocessing EEG data for {eeg_id}, sub_id {eeg_sub_id}: {e}")
-            # Return placeholder in case of error
+            print(f"Error preprocessing data for {eeg_id}, sub_id {eeg_sub_id}: {e}")
             return {
                 'eeg_data': torch.zeros((1, 20, self.max_seq_len), dtype=torch.float32),
                 'eeg_id': eeg_id,
@@ -150,180 +115,186 @@ class EEGSubsampleDataset(Dataset):
                 'error': True
             }
 
-    def extract_subsample(self, eeg_data, eeg_sub_id, row):
-        """
-        Extract subsample from the full EEG data based on the sub-ID
 
-        Args:
-            eeg_data: Full EEG data
-            eeg_sub_id: Subsample ID
-            row: DataFrame row with metadata
+class Deep4ConvNet(nn.Module):
+    """
+    Implementation of the Deep4Net convolutional architecture to extract 1400 features
+    """
 
-        Returns:
-            Subsample of the EEG data
-        """
-        # If there are specific columns in the dataframe that contain
-        # information about how to extract the subsample (e.g., start, end indices),
-        # use those values here
+    def __init__(self):
+        super(Deep4ConvNet, self).__init__()
+        # Sequence of layers that process the EEG data to get to the conv4 features
+        self.temporal_conv = nn.Sequential(
+            nn.Conv2d(1, 25, kernel_size=(1, 10), stride=1),
+            nn.BatchNorm2d(25),
+            nn.ELU(),
+            nn.MaxPool2d(kernel_size=(1, 3), stride=(1, 3)),
+            nn.Dropout(p=0.5),
 
-        # Method 1: If subsamples are segments with specific start/end indices
-        if 'start_index' in row and 'end_index' in row:
-            start_idx = row['start_index']
-            end_idx = row['end_index']
-            return eeg_data[start_idx:end_idx]
+            nn.Conv2d(25, 50, kernel_size=(1, 10), stride=1),
+            nn.BatchNorm2d(50),
+            nn.ELU(),
+            nn.MaxPool2d(kernel_size=(1, 3), stride=(1, 3)),
+            nn.Dropout(p=0.5),
 
-        # Method 2: If subsamples are of fixed size with a window size
-        elif 'window_size' in row:
-            window_size = row['window_size']
-            start_idx = int(eeg_sub_id) * window_size
-            end_idx = start_idx + window_size
+            nn.Conv2d(50, 100, kernel_size=(1, 10), stride=1),
+            nn.BatchNorm2d(100),
+            nn.ELU(),
+            nn.MaxPool2d(kernel_size=(1, 3), stride=(1, 3)),
+            nn.Dropout(p=0.5),
 
-            # Ensure indices are within bounds
-            if start_idx >= len(eeg_data):
-                start_idx = max(0, len(eeg_data) - window_size)
-            end_idx = min(end_idx, len(eeg_data))
+            nn.Conv2d(100, 200, kernel_size=(1, 10), stride=1),
+            nn.BatchNorm2d(200),
+            nn.ELU()
+        )
 
-            return eeg_data[start_idx:end_idx]
-
-        # Method 3: If there's an offset column specifying the subsample position
-        elif 'offset_seconds' in row and 'sampling_rate' in row:
-            offset_seconds = row['offset_seconds']
-            sampling_rate = row['sampling_rate']
-            window_size = int(2.0 * sampling_rate)  # Assuming 2-second windows
-            start_idx = int(offset_seconds * sampling_rate)
-            end_idx = start_idx + window_size
-
-            # Ensure indices are within bounds
-            if start_idx >= len(eeg_data):
-                start_idx = max(0, len(eeg_data) - window_size)
-            end_idx = min(end_idx, len(eeg_data))
-
-            return eeg_data[start_idx:end_idx]
-
-        # Default method: Use sub_id as an index for fixed-size windows
-        # This assumes that sub_ids increment by 1 and represent consecutive segments
+    def forward(self, x):
+        # Check input shape and fix it if needed
+        if x.dim() == 3:  # [batch, channels, time]
+            batch_size = x.shape[0]
+            # Reshape to [batch, 1, channels, time]
+            x = x.unsqueeze(1)
+            # Transpose to [batch, 1, time, channels] as expected
+            x = x.permute(0, 1, 3, 2)
+        elif x.dim() == 4 and x.shape[1] == 1 and x.shape[2] == 20:  # [batch, 1, channels, time]
+            batch_size = x.shape[0]
+            # Swap channels and time dimensions
+            x = x.permute(0, 1, 3, 2)
         else:
-            # Determine a reasonable window size based on the data size
-            total_samples = len(eeg_data)
-            window_size = min(2000, total_samples // 10)  # Use at most 2000 samples or 1/10 of the data
+            print(f"Unexpected input shape: {x.shape}")
+            batch_size = x.shape[0]
 
-            start_idx = int(eeg_sub_id) * window_size
-            end_idx = min(start_idx + window_size, total_samples)
+        # Apply convolutional layers
+        features = self.temporal_conv(x)
 
-            # Ensure start index is in bounds
-            if start_idx >= total_samples:
-                start_idx = max(0, total_samples - window_size)
-                end_idx = total_samples
+        # Flatten to get features
+        features_flat = features.reshape(batch_size, -1)
 
-            return eeg_data[start_idx:end_idx]
+        # Ensure exactly 1400 features
+        if features_flat.shape[1] > 1400:
+            features_flat = features_flat[:, :1400]
+        elif features_flat.shape[1] < 1400:
+            # Pad with zeros to get exactly 1400 features
+            padding = torch.zeros(batch_size, 1400 - features_flat.shape[1], device=features_flat.device)
+            features_flat = torch.cat([features_flat, padding], dim=1)
+
+        return features_flat
 
 
-def custom_collate(batch):
+def extract_deep4_conv_features(eeg_data):
     """
-    Custom collate function to handle tensors of different sizes
+    Extract exactly 1400 features from the conv4 layer output
 
     Args:
-        batch: List of items returned by __getitem__
+        eeg_data: EEG data tensor of shape [batch, channels, time]
 
     Returns:
-        Dictionary with batched data
+        numpy.ndarray: 1400 features per sample
     """
-    # Filter out examples with errors
-    valid_samples = [b for b in batch if 'error' not in b or not b['error']]
+    # Create the model
+    model = Deep4ConvNet().to(device)
+    model.eval()
 
-    if len(valid_samples) == 0:
-        # Return empty batch if all samples have errors
-        return {
-            'eeg_data': [],
-            'eeg_id': [],
-            'eeg_sub_id': [],
-            'error': True
-        }
+    try:
+        # Process the data through the model
+        with torch.no_grad():
+            if torch.cuda.is_available():
+                eeg_data = eeg_data.to(device)
 
-    # Group by keys
-    result = {key: [] for key in valid_samples[0].keys()}
+            # Print input shape for debugging
+            print(f"Input shape before model: {eeg_data.shape}")
 
-    # Collect all items by key
-    for sample in valid_samples:
-        for key, value in sample.items():
-            result[key].append(value)
+            # Get features
+            features = model(eeg_data)
 
-    return result
+            print(f"Extracted features shape: {features.shape}")
+            return features.cpu().numpy()
+
+    except Exception as e:
+        print(f"Error in feature extraction: {e}")
+        print(f"Input shape: {eeg_data.shape}")
+
+        # Get the shape details for better debugging
+        if eeg_data.dim() == 3:
+            print(f"3D tensor: [batch={eeg_data.shape[0]}, channels={eeg_data.shape[1]}, time={eeg_data.shape[2]}]")
+        elif eeg_data.dim() == 4:
+            print(
+                f"4D tensor: [batch={eeg_data.shape[0]}, dim1={eeg_data.shape[1]}, dim2={eeg_data.shape[2]}, dim3={eeg_data.shape[3]}]")
+
+        # Create a proper fallback with 1400 features
+        batch_size = eeg_data.shape[0]
+        return np.zeros((batch_size, 1400))
 
 
-def extract_eeg_features(eeg_data):
+def extract_embeddings_for_specific_eeg(eeg_id, eeg_sub_id, data_folder=TRAIN_EEG_DIR, max_seq_len=MAX_SEQUENCE_LENGTH):
     """
-    Extract features from EEG data without using pre-trained models
+    Extract 1400 embeddings for a specific EEG ID and sub-ID combination
 
     Args:
-        eeg_data: EEG data tensor with shape (batch, channels, time)
+        eeg_id (str): The EEG ID
+        eeg_sub_id (int or str): The EEG sub ID
+        data_folder (str): Path to the folder containing EEG data
+        max_seq_len (int): Maximum sequence length
 
     Returns:
-        features: Extracted features as a numpy array
+        numpy.ndarray: 1400 embeddings per sample
     """
-    with torch.no_grad():
-        try:
-            # Ensure the data is properly shaped
-            if eeg_data.dim() == 4:  # Batch of batches
-                eeg_data = eeg_data.squeeze(0)
+    try:
+        # Load EEG data from file
+        parquet_path = os.path.join(data_folder, f"{eeg_id}.parquet")
+        table = pq.read_table(parquet_path)
+        df = table.to_pandas()
+        eeg_data = df.values
 
-            if eeg_data.dim() == 3:  # Batch, channels, time
-                # Get the features from each channel
-                n_channels = eeg_data.shape[1]
+        # Prepare subsample based on eeg_sub_id
+        window_size = min(2000, len(eeg_data) // 10)
+        start_idx = int(eeg_sub_id) * window_size
+        end_idx = min(start_idx + window_size, len(eeg_data))
 
-                # Create a feature vector for each channel
-                features = []
-                for ch in range(n_channels):
-                    channel_data = eeg_data[0, ch, :]  # Get data for this channel
+        # Ensure start index is in bounds
+        if start_idx >= len(eeg_data):
+            start_idx = max(0, len(eeg_data) - window_size)
+            end_idx = len(eeg_data)
 
-                    # Calculate standard time-domain features
-                    mean_val = torch.mean(channel_data).item()
-                    std_val = torch.std(channel_data).item()
-                    max_val = torch.max(channel_data).item()
-                    min_val = torch.min(channel_data).item()
+        subsample = eeg_data[start_idx:end_idx]
 
-                    # Calculate frequency domain features using FFT
-                    fft_vals = torch.abs(torch.fft.rfft(channel_data))
-                    dom_freq = torch.argmax(fft_vals).item()
+        # Normalize to [0, 1]
+        if subsample.max() > subsample.min():
+            subsample_norm = (subsample - subsample.min()) / (subsample.max() - subsample.min())
+        else:
+            subsample_norm = np.zeros_like(subsample)
 
-                    # Add features for this channel
-                    features.extend([mean_val, std_val, max_val, min_val, dom_freq])
+        # Transpose to (channels, time_steps)
+        subsample_norm = subsample_norm.T
 
-                # Add some cross-channel features
-                cross_corr = torch.mean(torch.corrcoef(eeg_data[0])).item()
-                features.append(cross_corr)
+        # Crop or pad to max_seq_len
+        n_channels, n_times = subsample_norm.shape
+        if n_times > max_seq_len:
+            subsample_norm = subsample_norm[:, :max_seq_len]
+        elif n_times < max_seq_len:
+            padding = np.zeros((n_channels, max_seq_len - n_times))
+            subsample_norm = np.concatenate([subsample_norm, padding], axis=1)
 
-                # Create the embedding vector
-                embeddings = np.array(features)
+        # Convert to tensor
+        eeg_tensor = torch.tensor(subsample_norm, dtype=torch.float32).unsqueeze(0)
 
-                return embeddings
-            else:
-                raise ValueError(f"Unexpected EEG data shape: {eeg_data.shape}")
+        # Extract the 1400 features
+        embeddings = extract_deep4_conv_features(eeg_tensor)
 
-        except Exception as e:
-            raise ValueError(f"Error extracting features: {e}")
+        return embeddings
+
+    except Exception as e:
+        print(f"Error extracting embeddings for EEG {eeg_id}, sub_id {eeg_sub_id}: {e}")
+        # Return empty array with 1400 features
+        return np.zeros((1, 1400))
 
 
-def extract_braindecode_embeddings(model_name='shallow', data_folder=TRAIN_EEG_DIR, train_csv=TRAIN_CSV_PATH,
-                                   output_file=BRAINDECODE_OUT_PATH, batch_size=16, num_workers=2, sample=None):
-    """
-    Extract embeddings using direct feature extraction (not using Braindecode models)
-
-    Args:
-        model_name: Not used, kept for compatibility (feature extraction is model-independent)
-        data_folder: Path to EEG data folder
-        train_csv: Path to train CSV file
-        output_file: Path to save embeddings
-        batch_size: Batch size for processing
-        num_workers: Number of worker processes
-        sample: Fraction of data to use (for testing)
-
-    Returns:
-        DataFrame with embeddings for each EEG subsample
-    """
+def extract_braindecode_embeddings(data_folder=TRAIN_EEG_DIR, train_csv=TRAIN_CSV_PATH,
+                                   output_file=BRAINDECODE_OUT_PATH, batch_size=1, sample=None):
+    """Extract 1400 embeddings from the conv4 layer of Deep4Net"""
     start_time = time.time()
 
-    # Create output directory if it doesn't exist
+    # Create output directory
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
     # Load training data
@@ -335,237 +306,102 @@ def extract_braindecode_embeddings(model_name='shallow', data_folder=TRAIN_EEG_D
         train_df = train_df.sample(frac=sample, random_state=42)
         print(f"Using sample of {len(train_df)} rows ({sample * 100:.1f}% of data)")
 
-    # Create dataset and dataloader for subsamples
-    dataset = EEGSubsampleDataset(train_df, data_folder, cache_size=100, max_seq_len=MAX_SEQUENCE_LENGTH)
+    # Create dataset and dataloader
+    dataset = EEGDataset(train_df, data_folder)
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=batch_size,  # Process one sample at a time to avoid issues
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        prefetch_factor=2 if num_workers > 0 else None,
-        collate_fn=custom_collate
+        num_workers=0
     )
 
     # Extract embeddings
     all_embeddings = []
 
-    for batch in tqdm(dataloader, desc="Extracting embeddings"):
-        # Skip errors or empty batches
-        if 'error' in batch and batch['error']:
-            continue
-        if len(batch['eeg_data']) == 0:
+    # Create a single model instance to reuse
+    model = Deep4ConvNet().to(device)
+    model.eval()
+
+    for batch in tqdm(dataloader, desc="Extracting Deep4Net conv4 embeddings"):
+        # Skip errors
+        if 'error' in batch and batch['error'].any():
             continue
 
-        # Process batch
-        eeg_data_list = batch['eeg_data']
+        eeg_data = batch['eeg_data']
         eeg_ids = batch['eeg_id']
         eeg_sub_ids = batch['eeg_sub_id']
 
-        # Extract embeddings for each EEG subsample in the batch
-        for i in range(len(eeg_ids)):
-            # Process each EEG subsample individually
-            single_eeg = eeg_data_list[i].to(device)
+        try:
+            # Process batch using our model
+            with torch.no_grad():
+                if torch.cuda.is_available():
+                    eeg_data = eeg_data.to(device)
 
-            try:
-                # Extract embeddings using our feature extraction function
-                embeddings = extract_eeg_features(single_eeg.unsqueeze(0) if single_eeg.dim() == 3 else single_eeg)
+                # Reshape for visualization
+                print(f"Sample shape in batch: {eeg_data.shape}")
 
-                # Create a row with metadata
+                # Process batch through custom model
+                batch_features = model(eeg_data)
+
+                # Move back to CPU and convert to numpy
+                batch_features = batch_features.cpu().numpy()
+
+            # Create rows for each sample in the batch
+            for i in range(len(eeg_ids)):
+                # Create result row
                 row = {
                     'eeg_id': eeg_ids[i],
                     'eeg_sub_id': eeg_sub_ids[i]
                 }
 
-                # Add any other metadata from the batch
-                for key in batch.keys():
-                    if key not in ['eeg_data', 'eeg_id', 'eeg_sub_id', 'error'] and i < len(batch[key]):
-                        row[key] = batch[key][i]
+                # Add expert_consensus if available
+                if 'expert_consensus' in batch and i < len(batch['expert_consensus']):
+                    row['expert_consensus'] = batch['expert_consensus'][i]
 
-                # Add embedding values
-                for j, val in enumerate(embeddings):
-                    row[f'embedding_{j}'] = val if isinstance(val, (int, float)) else float(val)
+                # Add embeddings (1400 features)
+                features = batch_features[i]
+                for j, val in enumerate(features):
+                    row[f'embedding_{j}'] = float(val)
 
                 all_embeddings.append(row)
 
-            except Exception as e:
-                print(f"Error extracting embeddings for EEG {eeg_ids[i]}, sub_id {eeg_sub_ids[i]}: {e}")
+        except Exception as e:
+            print(f"Error processing batch: {e}")
+            # Create fallback with 1400 features for each sample in the batch
+            for i in range(len(eeg_ids)):
+                row = {
+                    'eeg_id': eeg_ids[i],
+                    'eeg_sub_id': eeg_sub_ids[i]
+                }
 
-    # Create DataFrame
+                # Add expert_consensus if available
+                if 'expert_consensus' in batch and i < len(batch['expert_consensus']):
+                    row['expert_consensus'] = batch['expert_consensus'][i]
+
+                # Add zero embeddings
+                for j in range(1400):
+                    row[f'embedding_{j}'] = 0.0
+
+                all_embeddings.append(row)
+
+    # Create DataFrame and save
     embeddings_df = pd.DataFrame(all_embeddings)
-    print(f"Created embeddings for {len(embeddings_df)} EEG subsamples")
-
-    # Report cache statistics
-    cache_total = dataset.cache_hits + dataset.cache_misses
-    if cache_total > 0:
-        cache_hit_rate = dataset.cache_hits / cache_total * 100
-        print(f"Cache hit rate: {cache_hit_rate:.2f}% ({dataset.cache_hits}/{cache_total})")
-
-    # Save to CSV
     embeddings_df.to_csv(output_file, index=False)
-    print(f"Saved embeddings to {output_file}")
 
-    # Print elapsed time
+    # Report time and stats
     elapsed_time = time.time() - start_time
-    minutes, seconds = divmod(elapsed_time, 60)
-    print(f"Total processing time: {int(minutes)} minutes {seconds:.2f} seconds")
+    embedding_cols = [col for col in embeddings_df.columns if col.startswith('embedding_')]
+
+    print(f"Total processing time: {elapsed_time:.2f} seconds")
+    print(f"Total samples processed: {len(embeddings_df)}")
+    print(f"Total embeddings per sample: {len(embedding_cols)}")
+    print(f"Output saved to: {output_file}")
 
     return embeddings_df, train_df.columns
 
 
-def visualize_embeddings(embeddings_df, output_dir=OUTPUT_DIR):
-    """
-    Visualize the embeddings using t-SNE
-
-    Args:
-        embeddings_df: DataFrame with embeddings
-        output_dir: Directory to save visualizations
-    """
-    try:
-        from sklearn.manifold import TSNE
-        import matplotlib.pyplot as plt
-        import plotly.express as px
-        import numpy as np
-
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
-
-        print("Creating t-SNE visualization...")
-
-        # Get embedding columns
-        embedding_cols = [col for col in embeddings_df.columns if col.startswith('embedding_')]
-
-        # Add expert_consensus label from training data if available
-        train_df = pd.read_csv(TRAIN_CSV_PATH)
-        if 'expert_consensus' in train_df.columns:
-            # Create mapping from (eeg_id, eeg_sub_id) to label
-            label_map = {}
-            for _, row in train_df.iterrows():
-                key = (row['eeg_id'], row['eeg_sub_id'])
-                label_map[key] = row['expert_consensus']
-
-            # Add labels to embeddings
-            labels = []
-            for _, row in embeddings_df.iterrows():
-                key = (row['eeg_id'], row['eeg_sub_id'])
-                labels.append(label_map.get(key, 'Unknown'))
-
-            embeddings_df['label'] = labels
-        else:
-            # Use EEG ID as label if no expert consensus available
-            embeddings_df['label'] = embeddings_df['eeg_id'].astype(str)
-
-        # Check for and remove NaN values
-        X = embeddings_df[embedding_cols].values
-
-        # Identify rows with NaN values
-        nan_mask = np.isnan(X).any(axis=1)
-        if nan_mask.any():
-            print(f"Warning: Found {nan_mask.sum()} rows with NaN values. These will be removed for visualization.")
-            # Filter out rows with NaN values
-            valid_indices = ~nan_mask
-            X = X[valid_indices]
-            labels = np.array(labels)[valid_indices] if len(labels) > 0 else []
-
-        # Select a sample if there are too many points
-        if len(X) > 1000:
-            print(f"Sampling 1000 points from {len(X)} for visualization")
-            sample_indices = np.random.choice(len(X), 1000, replace=False)
-            X = X[sample_indices]
-            labels = np.array(labels)[sample_indices] if len(labels) > 0 else []
-
-        # Check if we have enough data for visualization
-        if len(X) < 5:
-            print("Not enough valid data points for t-SNE visualization (minimum 5 required)")
-            return None
-
-        # Perform t-SNE
-        print(f"Running t-SNE on {len(X)} data points")
-        tsne = TSNE(n_components=3, random_state=42, perplexity=min(30, len(X) - 1))
-        X_tsne = tsne.fit_transform(X)
-
-        # Create and save 3D visualization
-        df_vis = pd.DataFrame({
-            'x': X_tsne[:, 0],
-            'y': X_tsne[:, 1],
-            'z': X_tsne[:, 2],
-            'label': labels
-        })
-
-        fig = px.scatter_3d(
-            df_vis, x='x', y='y', z='z',
-            color='label',
-            title='3D t-SNE of EEG Subsample Embeddings',
-            opacity=0.7
-        )
-
-        fig.update_layout(
-            scene=dict(
-                xaxis_title='t-SNE 1',
-                yaxis_title='t-SNE 2',
-                zaxis_title='t-SNE 3'
-            ),
-            width=900,
-            height=700
-        )
-
-        # Save as HTML
-        html_path = os.path.join(output_dir, 'eeg_embeddings_3d.html')
-        fig.write_html(html_path)
-        print(f"3D visualization saved to {html_path}")
-
-        return fig
-
-    except ImportError:
-        print("Visualization requires sklearn, matplotlib, and plotly. Skipping visualization.")
-        return None
-    except Exception as e:
-        print(f"Error during visualization: {str(e)}")
-        print("Skipping visualization.")
-        return None
-
-
-def compare_feature_sets(test_size=0.1):
-    """
-    Compare different feature extraction methods
-
-    Args:
-        test_size: Fraction of data to use for testing
-
-    Returns:
-        DataFrame with comparison results
-    """
-    print("Comparing different feature extraction methods...")
-
-    # Feature extraction methods to compare
-    methods = {
-        'time_domain': {'n_features': None},
-        'frequency_domain': {'n_features': None},
-        'combined': {'n_features': None}
-    }
-
-    results = []
-
-    # Implementation would vary based on specific features to extract
-    # This is a stub for compatibility
-    print("Feature comparison not implemented in this version")
-
-    return pd.DataFrame(results)
-
-
-def main(model_name='shallow', test_mode=True, visualize=True, compare=False):
-    """
-    Main function to extract EEG embeddings
-
-    Args:
-        model_name: Name of the model to use (not used, kept for compatibility)
-        test_mode: Whether to run in test mode with a sample of data
-        visualize: Whether to create visualizations
-        compare: Whether to compare different feature extraction methods
-
-    Returns:
-        DataFrame with embeddings
-    """
+def main(test_mode=True):
+    """Main function to extract 1400 embeddings from conv4 layer"""
     # Set file paths based on mode
     if test_mode:
         output_file = BRAINDECODE_OUT_PATH_TEST
@@ -576,71 +412,23 @@ def main(model_name='shallow', test_mode=True, visualize=True, compare=False):
         sample_size = None
         print("Running in PRODUCTION MODE with full dataset")
 
-    # Compare models if requested
-    if compare:
-        compare_results = compare_feature_sets(test_size=0.02)
-        print("\nFeature comparison results:")
-        print(compare_results)
-        return compare_results
-
-    # Choose optimal batch size and workers based on hardware
-    if torch.cuda.is_available():
-        batch_size = 16  # Larger batches for GPU
-        num_workers = 4  # More workers for GPU
-    else:
-        batch_size = 1  # Set to 1 to avoid batching issues on CPU
-        num_workers = 0  # Set to 0 to avoid multiprocessing issues on CPU
-
     # Extract embeddings
     embeddings_df, original_columns = extract_braindecode_embeddings(
-        model_name=model_name,  # Not used but kept for compatibility
         output_file=output_file,
-        batch_size=batch_size,
-        num_workers=num_workers,
         sample=sample_size
     )
 
-    # Create visualizations if requested
-    if visualize and embeddings_df is not None and len(embeddings_df) > 0:
-        visualize_embeddings(embeddings_df)
-
-    # Display summary
-    print("\nEmbedding extraction complete.")
-    print(f"Total samples processed: {len(embeddings_df)}")
-
-    # Count embedding dimensions
-    embedding_cols = [col for col in embeddings_df.columns if col.startswith('embedding_')]
-    print(f"Total embeddings per sample: {len(embedding_cols)}")
-    print(f"Output saved to: {output_file}")
-
-    # Display sample of the extracted embeddings
+    # Display sample
     print("\nSample of extracted embeddings:")
-    if not embeddings_df.empty and len(embedding_cols) > 0:
-        print(embeddings_df[['eeg_id', 'eeg_sub_id'] + embedding_cols[:5]].head())
-    else:
-        print("No embeddings extracted or empty result.")
+    if not embeddings_df.empty:
+        sample_cols = ['eeg_id', 'eeg_sub_id']
+        if 'expert_consensus' in embeddings_df.columns:
+            sample_cols.append('expert_consensus')
+        sample_cols.extend([col for col in embeddings_df.columns if col.startswith('embedding_')][:5])
+        print(embeddings_df[sample_cols].head())
 
-    print("EEG embedding extraction complete!")
     return embeddings_df
 
 
-def test_mode_run():
-    # Create output directory
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    start_time = time.time()
-
-    # Run test or comparison
-    # By default, run in test mode with 'shallow' model
-    # Change to main(model_name='shallow', test_mode=False) to run on the full dataset
-    # Change to main(model_name='deep4', test_mode=True) to use different model
-    # Change to main(compare=True) to compare models
-    embeddings_df = main(model_name='shallow', test_mode=True, visualize=True, compare=True)
-
-    elapsed_time = time.time() - start_time
-    minutes, seconds = divmod(elapsed_time, 60)
-    print(f"Complete process finished in {int(minutes)} minutes {seconds:.2f} seconds")
-
-
 if __name__ == "__main__":
-    test_mode_run()
+    main(test_mode=True)

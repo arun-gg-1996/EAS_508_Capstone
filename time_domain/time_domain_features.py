@@ -10,13 +10,7 @@ class EEGFeatureExtractor:
 
     def extract_features(self, eeg_data):
         """
-        Extract time-domain features from EEG data (10 features per signal)
-
-        Parameters:
-            eeg_data (numpy.ndarray): EEG data with shape (samples, channels)
-
-        Returns:
-            dict: Dictionary of extracted features
+        Extract time-domain features from EEG data
         """
         # Initialize features dictionary
         features = {}
@@ -35,7 +29,7 @@ class EEGFeatureExtractor:
             channel_data = eeg_data[:, ch]
             channel_name = f"channel_{ch}"
 
-            # Mean, Variance, Standard Deviation, RMS (already calculated)
+            # Mean, Variance, Standard Deviation, RMS
             features[f"{channel_name}_mean"] = means[ch]
             features[f"{channel_name}_var"] = variances[ch]
             features[f"{channel_name}_std"] = stds[ch]
@@ -50,23 +44,16 @@ class EEGFeatureExtractor:
             features[f"{channel_name}_kurtosis"] = stats.kurtosis(channel_data)
 
             # Hjorth Parameters
-            # Activity: variance of the signal (already calculated)
             activity = variances[ch]
 
-            # First derivative calculation
-            first_deriv = np.diff(channel_data)
-            first_deriv_padded = np.append(first_deriv, first_deriv[-1])
-            first_deriv_var = np.var(first_deriv_padded)
-
             # Mobility
+            first_deriv = np.diff(channel_data)
+            first_deriv_var = np.var(first_deriv)
             mobility = np.sqrt(first_deriv_var / activity) if activity > 0 else 0
 
-            # Second derivative
-            second_deriv = np.diff(first_deriv_padded)
-            second_deriv_padded = np.append(second_deriv, second_deriv[-1])
-            second_deriv_var = np.var(second_deriv_padded)
-
             # Complexity
+            second_deriv = np.diff(first_deriv)
+            second_deriv_var = np.var(second_deriv)
             complexity = (np.sqrt(second_deriv_var / first_deriv_var) / mobility
                           if first_deriv_var > 0 and mobility > 0 else 0)
 

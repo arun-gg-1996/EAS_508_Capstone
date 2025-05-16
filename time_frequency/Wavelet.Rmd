@@ -1,0 +1,662 @@
+---
+title: "EEG Wavelet Domain Features Analysis"
+author: "Data Scientist"
+date: "May 15, 2025"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.width = 10, fig.height = 6)
+```
+
+# 1. Introduction
+
+This analysis explores EEG wavelet domain features to predict expert consensus classifications. We'll implement:
+
+1. Data preprocessing and exploratory analysis
+2. Three machine learning models:
+   - LightGBM (gradient boosting)
+   - Random Forest with feature importance
+   - Support Vector Machine with RBF kernel
+3. Performance evaluation including confusion matrices and F1 scores
+
+# 2. Environment Setup
+
+```{r load_libraries}
+# Function to install missing packages
+install_if_missing <- function(packages) {
+  new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+  if(length(new_packages)) {
+    repos <- "https://cloud.r-project.org"
+    install.packages(new_packages, dependencies = TRUE, repos = repos)
+  }
+}
+
+# List of required packages
+required_packages <- c("tidyverse", "caret", "ranger", "lightgbm", "e1071", 
+                      "ggplot2", "corrplot", "doParallel", "pROC", 
+                      "reshape2", "viridis")
+
+# Install missing packages
+install_if_missing(required_packages)
+
+# Load necessary libraries
+library(tidyverse)
+library(caret)
+library(ranger)
+library(lightgbm)
+library(e1071)
+library(ggplot2)
+library(corrplot)
+library(doParallel)
+library(pROC)
+library(reshape2)
+library(viridis)
+
+# Set seed for reproducibility
+set.seed(42)
+
+# Set up parallel processing
+registerDoParallel(cores = parallel::detectCores() - 1)
+```
+
+# 3. Data Loading and Exploration
+
+```{r load_data}
+# Using file.path for OS-independent path handling
+file_path <- file.path("..", "out", "test", "eeg_wavelet_domain_features_test.csv")
+
+# Load with error handling
+wavelet_data <- tryCatch({
+  read.csv(file_path)
+}, error = function(e) {
+  # Print detailed error info
+  cat("Error: Could not read file at path:", file_path, "\n")
+  cat("Working directory is:", getwd(), "\n")
+  
+  # Try alternative path
+  alt_path <- file.path("out", "test", "vit_embeddings_test.csv")
+  cat("Trying alternative path:", alt_path, "\n")
+  tryCatch({
+    read.csv(alt_path)
+  }, error = function(e2) {
+    # Try one more alternative path
+    alt_path2 <- "vit_embeddings_test.csv"
+    cat("Trying directly in current directory:", alt_path2, "\n")
+    tryCatch({
+      read.csv(alt_path2)
+    }, error = function(e3) {
+      stop("Could not find the file. Please check file path.")
+    })
+  })
+})
+
+# Basic data information
+cat("Successfully loaded data with", nrow(wavelet_data), "rows and", ncol(wavelet_data), "columns\n")
+
+# Structure of data
+str(wavelet_data, list.len = 10)
+
+# Check for missing values
+missing_values <- colSums(is.na(wavelet_data))
+if(sum(missing_values) > 0) {
+  cat("Missing values found in", sum(missing_values > 0), "columns\n")
+} else {
+  cat("No missing values found in the dataset\n")
+}
+
+# Convert target to factor
+wavelet_data$expert_consensus <- as.factor(wavelet_data$expert_consensus)
+
+# Target distribution
+target_dist <- table(wavelet_data$expert_consensus)
+print("Class distribution:")
+print(target_dist)
+```
+
+```{r visualize_target}
+# Visualize class distribution
+barplot_data <- data.frame(
+  Class = names(target_dist),
+  Count = as.numeric(target_dist)
+)
+
+ggplot(barplot_data, aes(x = Class, y = Count, fill = Class)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = Count), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Distribution of Expert Consensus Classes",
+       x = "Class", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# 4. Data Preprocessing and Feature Analysis
+
+```{r preprocess_data}
+# Remove ID columns for modeling
+feature_cols <- setdiff(names(wavelet_data), c("eeg_id", "eeg_sub_id", "expert_consensus"))
+X <- wavelet_data[, feature_cols]
+y <- wavelet_data$expert_consensus
+
+# Split data into training and testing sets (70/30)
+set.seed(42)
+train_index <- createDataPartition(y, p = 0.7, list = FALSE)
+X_train <- X[train_index, ]
+X_test <- X[-train_index, ]
+y_train <- y[train_index]
+y_test <- y[-train_index]
+
+# Check if we have enough data for a meaningful split
+if(length(unique(y_train)) < length(unique(y))) {
+  warning("Training set doesn't contain all classes! Using stratified sampling.")
+  # If sample is too small, use all data but remember this is for demonstration
+  X_train <- X
+  y_train <- y
+  # Create a small test set that includes all classes
+  test_indices <- createDataPartition(y, p = 0.3, list = FALSE)
+  X_test <- X[test_indices, ]
+  y_test <- y[test_indices]
+}
+
+# Basic feature statistics
+cat("Number of features:", ncol(X), "\n")
+
+# Sample correlation matrix (for a subset of features)
+if(ncol(X) > 30) {
+  set.seed(123)
+  sample_size <- 30
+  sample_features <- sample(names(X), sample_size)
+  corr_matrix <- cor(X_train[, sample_features])
+} else {
+  corr_matrix <- cor(X_train)
+}
+
+# Visualize correlation
+corrplot(corr_matrix, method = "circle", type = "upper", 
+         tl.cex = 0.6, tl.col = "black", tl.srt = 45,
+         title = "Sample Feature Correlation")
+
+# Feature preprocessing - standardize
+preProc <- preProcess(X_train, method = c("center", "scale"))
+X_train_scaled <- predict(preProc, X_train)
+X_test_scaled <- predict(preProc, X_test)
+```
+
+```{r feature_types_analysis}
+# Analyze different types of wavelet features
+feature_types <- c("energy", "rel_energy", "mean", "std", "kurt", "skew")
+brain_waves <- c("gamma", "beta", "alpha", "theta")
+
+# Count features by type
+feature_counts <- sapply(feature_types, function(type) {
+  sum(grepl(type, names(X)))
+})
+
+# Count wavelet brain wave features
+wave_counts <- sapply(brain_waves, function(wave) {
+  sum(grepl(wave, names(X)))
+})
+
+# Plot feature type distribution
+par(mfrow = c(1, 2))
+barplot(feature_counts, main = "Feature Types", col = "skyblue", 
+        las = 2, cex.names = 0.8)
+barplot(wave_counts, main = "Brain Wave Features", col = "lightgreen",
+        las = 2, cex.names = 0.8)
+par(mfrow = c(1, 1))
+```
+
+# 5. Model 1: LightGBM with Basic Tuning
+
+```{r lightgbm_setup}
+# Prepare data for LightGBM
+num_classes <- length(levels(y_train))
+y_train_numeric <- as.integer(y_train) - 1  # Convert to 0-based index
+
+dtrain <- lgb.Dataset(
+  data = as.matrix(X_train_scaled),
+  label = y_train_numeric
+)
+
+# Define basic parameters for LightGBM
+lgb_params <- list(
+  objective = "multiclass",
+  metric = "multi_logloss",
+  num_class = num_classes,
+  verbose = -1,
+  feature_pre_filter = FALSE
+)
+
+# Simple parameter options for LightGBM
+param_sets <- list(
+  list(num_leaves = 31, learning_rate = 0.1, max_depth = 6),
+  list(num_leaves = 63, learning_rate = 0.05, max_depth = 8)
+)
+
+# Train LightGBM model with best parameters
+set.seed(42)
+lgb_model <- lgb.train(
+  params = c(lgb_params, param_sets[[1]]),  # Using first parameter set for simplicity
+  data = dtrain,
+  nrounds = 100,
+  verbose = 0
+)
+
+# Feature importance
+lgb_importance <- lgb.importance(lgb_model, percentage = TRUE)
+print("Top 10 important features in LightGBM:")
+print(head(lgb_importance, 10))
+
+# Make predictions
+lgb_probs <- predict(lgb_model, as.matrix(X_test_scaled))
+lgb_prob_matrix <- matrix(lgb_probs, ncol = num_classes, byrow = TRUE)
+lgb_preds <- max.col(lgb_prob_matrix) - 1  # Get class with highest probability
+lgb_preds <- factor(lgb_preds, levels = 0:(num_classes-1))  # Convert to factor
+
+# Convert y_test to same factor levels for comparison
+y_test_numeric <- as.integer(y_test) - 1
+y_test_factor <- factor(y_test_numeric, levels = 0:(num_classes-1))
+
+# Calculate confusion matrix
+if(length(levels(lgb_preds)) == length(levels(y_test_factor))) {
+  lgb_cm <- confusionMatrix(lgb_preds, y_test_factor)
+  print("LightGBM Performance:")
+  print(lgb_cm$overall)
+} else {
+  # Handle potential mismatch in predicted classes
+  cat("Warning: Classes in predictions don't match test set classes.\n")
+  common_levels <- intersect(levels(lgb_preds), levels(y_test_factor))
+  lgb_preds_subset <- factor(lgb_preds[lgb_preds %in% common_levels], levels = common_levels)
+  y_test_subset <- factor(y_test_factor[y_test_factor %in% common_levels], levels = common_levels)
+  
+  if(length(lgb_preds_subset) > 0) {
+    lgb_cm <- confusionMatrix(lgb_preds_subset, y_test_subset)
+    print("LightGBM Performance (on common classes):")
+    print(lgb_cm$overall)
+  } else {
+    cat("Cannot compute confusion matrix - no common classes in predictions and test set.\n")
+  }
+}
+```
+
+# 6. Model 2: Random Forest
+
+```{r rf_setup}
+# Train Random Forest
+set.seed(42)
+rf_model <- ranger(
+  formula = y_train ~ .,
+  data = data.frame(X_train_scaled, y_train = y_train),
+  num.trees = 500,
+  importance = 'impurity',
+  probability = TRUE
+)
+
+# Feature importance
+rf_importance <- data.frame(
+  Feature = names(X_train),
+  Importance = rf_model$variable.importance
+)
+rf_importance <- rf_importance[order(rf_importance$Importance, decreasing = TRUE), ]
+
+print("Top 10 important features in Random Forest:")
+print(head(rf_importance, 10))
+
+# Make predictions
+rf_preds_prob <- predict(rf_model, data = X_test_scaled)$predictions
+rf_preds <- factor(max.col(rf_preds_prob) - 1, levels = 0:(num_classes-1))
+
+# Calculate confusion matrix
+if(length(levels(rf_preds)) == length(levels(y_test_factor))) {
+  rf_cm <- confusionMatrix(rf_preds, y_test_factor)
+  print("Random Forest Performance:")
+  print(rf_cm$overall)
+} else {
+  # Handle potential mismatch
+  common_levels <- intersect(levels(rf_preds), levels(y_test_factor))
+  rf_preds_subset <- factor(rf_preds[rf_preds %in% common_levels], levels = common_levels)
+  y_test_subset <- factor(y_test_factor[y_test_factor %in% common_levels], levels = common_levels)
+  
+  if(length(rf_preds_subset) > 0) {
+    rf_cm <- confusionMatrix(rf_preds_subset, y_test_subset)
+    print("Random Forest Performance (on common classes):")
+    print(rf_cm$overall)
+  } else {
+    cat("Cannot compute confusion matrix - no common classes in predictions and test set.\n")
+  }
+}
+```
+
+# 7. Model 3: Logistic Regression
+
+```{r logistic_regression_setup}
+# Try to train Logistic Regression with robust error handling
+tryCatch({
+  # First, make sure data is properly prepared
+  X_train_matrix <- as.matrix(X_train_scaled)
+  X_train_matrix[!is.finite(X_train_matrix)] <- 0
+  X_test_matrix <- as.matrix(X_test_scaled)
+  X_test_matrix[!is.finite(X_test_matrix)] <- 0
+  
+  # Apply PCA if data has many features to avoid overfitting in logistic regression
+  if(ncol(X_train_matrix) > 50) {
+    pca_result <- prcomp(X_train_matrix, center = TRUE, scale. = FALSE)
+    variance_explained <- cumsum(pca_result$sdev^2)/sum(pca_result$sdev^2)
+    
+    # Find number of components for 95% variance or use at most 30
+    if(any(variance_explained >= 0.95)) {
+      n_components <- min(which(variance_explained >= 0.95))
+    } else {
+      n_components <- min(30, length(variance_explained))
+    }
+    
+    cat("Using", n_components, "PCA components for Logistic Regression\n")
+    
+    # Transform data
+    X_train_for_lr <- predict(pca_result, X_train_matrix)[, 1:n_components]
+    X_test_for_lr <- predict(pca_result, X_test_matrix)[, 1:n_components]
+    
+    # Prepare data frames for model training
+    train_data_lr <- data.frame(X_train_for_lr)
+    train_data_lr$y_train <- y_train
+    
+    test_data_lr <- data.frame(X_test_for_lr)
+  } else {
+    # Use the cleaned data directly if fewer features
+    train_data_lr <- data.frame(X_train_matrix)
+    train_data_lr$y_train <- y_train
+    
+    test_data_lr <- data.frame(X_test_matrix)
+  }
+  
+  # Train logistic regression - using caret for consistency with other models
+  set.seed(42)
+  
+  # multiclass logistic regression via caret
+  lr_model <- train(
+    y_train ~ ., 
+    data = train_data_lr,
+    method = "multinom",  # Multinomial logistic regression
+    trControl = trainControl(
+      method = "cv",
+      number = 5,
+      verboseIter = FALSE
+    ),
+    trace = FALSE  # Suppress convergence messages
+  )
+  
+  # Make predictions
+  lr_preds <- predict(lr_model, newdata = test_data_lr)
+  
+  # Calculate confusion matrix
+  lr_cm <- confusionMatrix(lr_preds, y_test)
+  print("Logistic Regression Performance:")
+  print(lr_cm$overall)
+  
+  # Get variable importance if possible
+  if("varImp" %in% methods(class(lr_model))) {
+    lr_importance <- varImp(lr_model)
+    print("Top 10 important features in Logistic Regression:")
+    print(head(lr_importance$importance, 10))
+  }
+  
+}, error = function(e) {
+  cat("Error in Logistic Regression:", e$message, "\n")
+  
+  # Try a simpler approach as fallback
+  cat("Trying simpler Logistic Regression as fallback...\n")
+  
+  tryCatch({
+    # Use glmnet for regularized logistic regression (handles many features better)
+    required_packages <- c("glmnet")
+    install_if_missing(required_packages)
+    library(glmnet)
+    
+    # Prepare data for glmnet
+    x_train_simple <- as.matrix(X_train_scaled)
+    x_test_simple <- as.matrix(X_test_scaled)
+    y_train_simple <- as.numeric(y_train) - 1  # Convert to 0-based numeric
+    
+    # Train model with cross-validation for lambda selection
+    cv_fit <- cv.glmnet(
+      x = x_train_simple,
+      y = y_train_simple,
+      family = "multinomial",
+      alpha = 0.5,  # Elastic net (mix of L1 and L2 regularization)
+      type.measure = "class"
+    )
+    
+    # Select model with best lambda
+    lr_simple <- glmnet(
+      x = x_train_simple,
+      y = y_train_simple,
+      family = "multinomial",
+      alpha = 0.5,
+      lambda = cv_fit$lambda.min
+    )
+    
+    # Make predictions
+    lr_probs <- predict(lr_simple, newx = x_test_simple, type = "response")[,,1]
+    lr_pred_class <- apply(lr_probs, 1, which.max) - 1  # Adjust for 0-based indexing
+    lr_preds <- factor(lr_pred_class, levels = unique(as.numeric(y_test) - 1))
+    
+    # Convert y_test to numeric for confusion matrix
+    y_test_numeric <- as.numeric(y_test) - 1
+    y_test_factor <- factor(y_test_numeric, levels = unique(y_test_numeric))
+    
+    # Calculate confusion matrix
+    lr_cm <<- confusionMatrix(lr_preds, y_test_factor)
+    print("Simple Logistic Regression Performance:")
+    print(lr_cm$overall)
+    
+  }, error = function(e2) {
+    cat("Error in simple Logistic Regression too:", e2$message, "\n")
+    cat("Skipping Logistic Regression analysis completely.\n")
+  })
+})
+```
+
+# 8. Model Comparison and Evaluation
+
+```{r model_comparison}
+
+model_metrics <- data.frame(
+  Model = c("LightGBM", "Random Forest", "LR"),
+  Accuracy = c(
+    ifelse(exists("lgb_cm"), lgb_cm$overall["Accuracy"], NA),
+    ifelse(exists("rf_cm"), rf_cm$overall["Accuracy"], NA),
+    ifelse(exists("lr_cm"), lr_cm$overall["Accuracy"], NA)  # CORRECTED
+  ),
+  Kappa = c(
+    ifelse(exists("lgb_cm"), lgb_cm$overall["Kappa"], NA),
+    ifelse(exists("rf_cm"), rf_cm$overall["Kappa"], NA),
+    ifelse(exists("lr_cm"), lr_cm$overall["Kappa"], NA)     # CORRECTED
+  )
+)
+
+# Print comparison table
+print("Model Performance Comparison:")
+print(model_metrics)
+
+# Plot comparison
+ggplot(model_metrics, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.4f", Accuracy)), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Model Accuracy Comparison",
+       y = "Accuracy") +
+  theme_minimal() +
+  ylim(0, 1)
+```
+
+```{r plot_cm}
+# Function to plot confusion matrix
+plot_cm <- function(cm, title) {
+  cm_table <- as.data.frame(cm$table)
+  names(cm_table) <- c("Reference", "Prediction", "Freq")
+  
+  # Calculate percentages
+  cm_table <- cm_table %>%
+    group_by(Reference) %>%
+    mutate(Total = sum(Freq),
+           Percentage = Freq / Total * 100) %>%
+    ungroup()
+  
+  # Create plot
+  ggplot(cm_table, aes(x = Prediction, y = Reference, fill = Percentage)) +
+    geom_tile() +
+    geom_text(aes(label = sprintf("%d\n(%.1f%%)", Freq, Percentage)), 
+              color = "black", size = 3) +
+    scale_fill_gradient2(low = "white", high = "darkblue", mid = "skyblue",
+                       midpoint = 50, limits = c(0, 100)) +
+    labs(title = title,
+         x = "Predicted Class", 
+         y = "True Class") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# Plot best model's confusion matrix
+best_model_idx <- which.max(model_metrics$Accuracy)
+best_model_name <- model_metrics$Model[best_model_idx]
+
+if(best_model_name == "LightGBM" && exists("lgb_cm")) {
+  plot_cm(lgb_cm, "LightGBM Confusion Matrix")
+} else if(best_model_name == "Random Forest" && exists("rf_cm")) {
+  plot_cm(rf_cm, "Random Forest Confusion Matrix")
+} else if(best_model_name == "LR" && exists("lr_cm")) {     # CORRECTED
+  plot_cm(lr_cm, "Logistic Regression Confusion Matrix")    # CORRECTED
+}
+```
+
+# 9. Feature Importance Analysis
+
+```{r feature_importance_analysis}
+# Analyze feature importance from the best model
+if(best_model_name == "LightGBM" && exists("lgb_importance")) {
+  # Plot top features
+  top_n <- min(20, nrow(lgb_importance))
+  imp_data <- head(lgb_importance, top_n)
+  
+  ggplot(imp_data, aes(x = reorder(Feature, Gain), y = Gain)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    labs(title = "LightGBM Top Feature Importance",
+         x = "Feature", y = "Gain") +
+    theme_minimal()
+  
+} else if(best_model_name == "Random Forest" && exists("rf_importance")) {
+  # Plot RF importance
+  top_n <- min(20, nrow(rf_importance))
+  imp_data <- head(rf_importance, top_n)
+  
+  ggplot(imp_data, aes(x = reorder(Feature, Importance), y = Importance)) +
+    geom_bar(stat = "identity", fill = "forestgreen") +
+    coord_flip() +
+    labs(title = "Random Forest Top Feature Importance",
+         x = "Feature", y = "Importance") +
+    theme_minimal()
+}
+```
+
+# 10. Feature Type Analysis
+
+```{r feature_type_importance}
+# Function to categorize features
+categorize_feature <- function(feature_name) {
+  # Check for brain wave type
+  if(grepl("gamma", feature_name)) {
+    wave_type <- "gamma"
+  } else if(grepl("beta", feature_name)) {
+    wave_type <- "beta"
+  } else if(grepl("alpha", feature_name)) {
+    wave_type <- "alpha"
+  } else if(grepl("theta", feature_name)) {
+    wave_type <- "theta"
+  } else {
+    wave_type <- "other"
+  }
+  
+  # Check for feature statistic type
+  if(grepl("energy", feature_name)) {
+    if(grepl("rel_energy", feature_name)) {
+      stat_type <- "rel_energy"
+    } else {
+      stat_type <- "energy"
+    }
+  } else if(grepl("mean", feature_name)) {
+    stat_type <- "mean"
+  } else if(grepl("std", feature_name)) {
+    stat_type <- "std"
+  } else if(grepl("kurt", feature_name)) {
+    stat_type <- "kurt"
+  } else if(grepl("skew", feature_name)) {
+    stat_type <- "skew"
+  } else {
+    stat_type <- "other"
+  }
+  
+  return(list(wave_type = wave_type, stat_type = stat_type))
+}
+
+# Process top features based on best model
+if(best_model_name == "LightGBM" && exists("lgb_importance")) {
+  top_features <- head(lgb_importance, 30)$Feature
+} else if(best_model_name == "Random Forest" && exists("rf_importance")) {
+  top_features <- head(rf_importance, 30)$Feature
+} else {
+  top_features <- character(0)
+}
+
+# Analyze categories in top features
+if(length(top_features) > 0) {
+  categories <- lapply(top_features, categorize_feature)
+  wave_types <- sapply(categories, function(x) x$wave_type)
+  stat_types <- sapply(categories, function(x) x$stat_type)
+  
+  # Create summary tables
+  wave_summary <- table(wave_types)
+  stat_summary <- table(stat_types)
+  
+  # Plot summaries
+  par(mfrow = c(1, 2))
+  barplot(wave_summary, main = "Brain Wave Types in Top Features", 
+          col = rainbow(length(wave_summary)))
+  barplot(stat_summary, main = "Statistic Types in Top Features",
+          col = rainbow(length(stat_summary)))
+  par(mfrow = c(1, 1))
+}
+```
+
+# 11. Conclusion
+
+```{r conclusion}
+# Find best model
+best_idx <- which.max(model_metrics$Accuracy)
+best_model <- model_metrics$Model[best_idx]
+
+cat("Best performing model:", best_model, "\n")
+cat("Accuracy:", model_metrics$Accuracy[best_idx], "\n")
+cat("Kappa:", model_metrics$Kappa[best_idx], "\n")
+
+# Key findings from the analysis
+cat("\nKey Findings:\n")
+cat("1. The wavelet domain features show predictive power for EEG classification\n")
+cat("2. The most important features identified were:\n")
+
+if(best_model == "LightGBM" && exists("lgb_importance")) {
+  cat("   - ", paste(head(lgb_importance$Feature, 5), collapse = "\n   - "), "\n")
+} else if(best_model == "Random Forest" && exists("rf_importance")) {
+  cat("   - ", paste(head(rf_importance$Feature, 5), collapse = "\n   - "), "\n")
+}
+
+cat("3. Recommendation: ", best_model, " performed best and should be considered for production use\n")
+```

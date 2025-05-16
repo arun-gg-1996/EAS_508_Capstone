@@ -1,0 +1,642 @@
+---
+title: "EEG Non-Linear Features Analysis with Voting Classifier"
+author: "Data Scientist"
+date: "May 15, 2025"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+# 1. Introduction
+
+This analysis explores EEG non-linear features to predict expert consensus classifications. We'll implement:
+
+- Basic data exploration of features like fractal dimensions, entropy measures, and complexity
+- Three machine learning models: LightGBM, Random Forest, and LR
+- A voting classifier combining these three models
+- Feature importance analysis focused on non-linear measures
+
+# 2. Environment Setup
+
+```{r load_libraries}
+# Load necessary libraries
+library(tidyverse)
+library(caret)
+library(ranger)
+library(lightgbm)
+library(e1071)
+library(ggplot2)
+library(corrplot)
+library(doParallel)
+library(pROC)
+library(reshape2)
+library(viridis)
+library(caretEnsemble)
+library(nnet)  # For multinom method (multinomial logistic regression)
+
+# Set seed for reproducibility
+set.seed(42)
+
+# Set up parallel processing
+registerDoParallel(cores = parallel::detectCores() - 1)
+```
+
+# 3. Data Loading and Exploration
+
+```{r load_data}
+# Load data directly
+nonlinear_data <- read.csv("eeg_nonlinear_domain_features_test.csv")
+
+# Basic data information
+cat("Data dimensions:", nrow(nonlinear_data), "rows and", ncol(nonlinear_data), "columns\n")
+
+# Structure of data
+str(nonlinear_data, list.len = 10)
+
+# Check for missing values
+missing_values <- colSums(is.na(nonlinear_data))
+if(sum(missing_values) > 0) {
+  cat("Missing values found in", sum(missing_values > 0), "columns\n")
+} else {
+  cat("No missing values found in the dataset\n")
+}
+
+# Convert target to factor
+nonlinear_data$expert_consensus <- as.factor(nonlinear_data$expert_consensus)
+
+# Target distribution
+target_dist <- table(nonlinear_data$expert_consensus)
+print("Class distribution:")
+print(target_dist)
+```
+
+```{r visualize_target}
+# Visualize class distribution
+barplot_data <- data.frame(
+  Class = names(target_dist),
+  Count = as.numeric(target_dist)
+)
+
+ggplot(barplot_data, aes(x = Class, y = Count, fill = Class)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = Count), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Distribution of Expert Consensus Classes",
+       x = "Class", y = "Count") +
+  theme_minimal()
+```
+
+# 4. Data Preprocessing and Feature Analysis
+
+```{r preprocess_data}
+# Remove ID columns for modeling
+feature_cols <- setdiff(names(nonlinear_data), c("eeg_id", "eeg_sub_id", "expert_consensus"))
+X <- nonlinear_data[, feature_cols]
+y <- nonlinear_data$expert_consensus
+
+# Split data into training and testing sets (70/30)
+if(nrow(nonlinear_data) > 5) {
+  train_index <- createDataPartition(y, p = 0.7, list = FALSE)
+  X_train <- X[train_index, ]
+  X_test <- X[-train_index, ]
+  y_train <- y[train_index]
+  y_test <- y[-train_index]
+} else {
+  cat("Dataset too small for splitting, using all data for demonstration\n")
+  X_train <- X
+  X_test <- X
+  y_train <- y
+  y_test <- y
+}
+
+# Feature preprocessing - standardize
+preProc <- preProcess(X_train, method = c("center", "scale"))
+X_train_scaled <- predict(preProc, X_train)
+X_test_scaled <- predict(preProc, X_test)
+
+# Basic feature statistics
+cat("Number of features:", ncol(X), "\n")
+
+# Create correlation matrix for visualization
+if(ncol(X) > 30) {
+  # Sample some features for better visualization
+  set.seed(123)
+  sample_features <- sample(names(X), 30)
+  corr_subset <- cor(X[, sample_features])
+  corrplot(corr_subset, method = "circle",
+           type = "upper", tl.cex = 0.6,
+           tl.col = "black", tl.srt = 45,
+           title = "Sample Feature Correlation")
+} else {
+  corr_matrix <- cor(X)
+  corrplot(corr_matrix, method = "circle",
+           type = "upper", tl.cex = 0.6,
+           tl.col = "black", tl.srt = 45,
+           title = "Feature Correlation")
+}
+```
+
+```{r feature_types_analysis}
+# Analyze non-linear feature types
+feature_types <- c("petrosian_fd", "katz_fd", "higuchi_fd", "dfa",
+                  "sample_entropy", "perm_entropy", "spectral_entropy",
+                  "binary_complexity")
+
+# Count features by type
+feature_counts <- sapply(feature_types, function(type) {
+  sum(grepl(type, names(X)))
+})
+
+# Count features by channel
+channel_counts <- sapply(0:19, function(channel) {
+  sum(grepl(paste0("channel_", channel, "_"), names(X)))
+})
+
+# Plot feature type distribution
+par(mfrow = c(1, 2))
+barplot(feature_counts, main = "Non-Linear Feature Types",
+        col = "skyblue", las = 2, cex.names = 0.8)
+barplot(channel_counts, main = "Features by Channel",
+        col = "lightgreen", las = 2, cex.names = 0.8,
+        names.arg = paste0("Ch", 0:19))
+par(mfrow = c(1, 1))
+
+# Display basic statistics for each feature type
+feature_stats <- lapply(feature_types, function(type) {
+  cols <- grep(type, names(X), value = TRUE)
+  if(length(cols) > 0) {
+    data.frame(
+      Feature_Type = type,
+      Mean = mean(sapply(cols, function(col) mean(X[[col]], na.rm = TRUE))),
+      Std_Dev = mean(sapply(cols, function(col) sd(X[[col]], na.rm = TRUE))),
+      Min = min(sapply(cols, function(col) min(X[[col]], na.rm = TRUE))),
+      Max = max(sapply(cols, function(col) max(X[[col]], na.rm = TRUE)))
+    )
+  }
+})
+feature_stats_df <- do.call(rbind, feature_stats)
+print(feature_stats_df)
+```
+
+# 5. Individual Model Training
+
+```{r train_models}
+# Define common training control settings
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  classProbs = TRUE,
+  savePredictions = "final"
+)
+
+# Train Random Forest
+set.seed(42)
+rf_model <- train(
+  x = X_train_scaled,
+  y = y_train,
+  method = "ranger",
+  trControl = train_control,
+  tuneLength = 3,
+  importance = 'impurity'
+)
+
+# Train Logistic Regression
+set.seed(42)
+lr_model <- train(
+  x = X_train_scaled,
+  y = y_train,
+  method = "multinom",  # Multinomial logistic regression
+  trControl = train_control,
+  tuneLength = 3,
+  trace = FALSE  # Suppress iteration output
+)
+
+# LightGBM needs special handling
+# First convert data to matrix format
+dtrain <- lgb.Dataset(
+  data = as.matrix(X_train_scaled),
+  label = as.integer(y_train) - 1
+)
+
+# Set LightGBM parameters
+lgb_params <- list(
+  objective = "multiclass",
+  metric = "multi_logloss",
+  num_class = length(levels(y_train)),
+  learning_rate = 0.1,
+  max_depth = 6,
+  num_leaves = 31
+)
+
+# Train LightGBM model
+set.seed(42)
+lgb_model <- lgb.train(
+  params = lgb_params,
+  data = dtrain,
+  nrounds = 100,
+  verbose = 0
+)
+
+# Get variable importance from LightGBM
+lgb_importance <- lgb.importance(lgb_model, percentage = TRUE)
+```
+
+# 6. Voting Classifier Implementation
+
+```{r voting_classifier}
+# We'll create a soft voting classifier
+# For this, we need predictions from all models
+
+# Function to get probabilities for all models
+get_all_model_probs <- function(models, X_scaled, y_true) {
+  # Random Forest probs
+  rf_probs <- predict(models$rf, X_scaled, type = "prob")
+
+  # Logistic Regression probs
+  lr_probs <- predict(models$lr, X_scaled, type = "prob")
+
+  # LightGBM probs
+  lgb_raw_probs <- predict(models$lgb, as.matrix(X_scaled))
+  lgb_probs_matrix <- matrix(lgb_raw_probs,
+                            ncol = length(levels(y_true)),
+                            byrow = TRUE)
+  lgb_probs <- as.data.frame(lgb_probs_matrix)
+  colnames(lgb_probs) <- levels(y_true)
+
+  # Return list of probability dataframes
+  return(list(
+    rf = rf_probs,
+    lr = lr_probs,
+    lgb = lgb_probs
+  ))
+}
+
+# Function to make soft voting predictions
+soft_voting_predict <- function(all_probs, weights = c(1, 1, 1)) {
+  # Normalize weights
+  weights <- weights / sum(weights)
+
+  # Weighted average of probabilities
+  rf_weighted <- all_probs$rf * weights[1]
+  lr_weighted <- all_probs$lr * weights[2]
+  lgb_weighted <- all_probs$lgb * weights[3]
+
+  # Sum the weighted probabilities
+  ensemble_probs <- rf_weighted + lr_weighted + lgb_weighted
+
+  # Get predicted classes
+  predicted_classes <- factor(colnames(ensemble_probs)[max.col(ensemble_probs)],
+                             levels = colnames(ensemble_probs))
+
+  return(list(
+    predicted = predicted_classes,
+    probabilities = ensemble_probs
+  ))
+}
+
+# Package all models for convenience
+models <- list(
+  rf = rf_model,
+  lr = lr_model,
+  lgb = lgb_model
+)
+
+# Get probabilities for training data
+train_probs <- get_all_model_probs(models, X_train_scaled, y_train)
+
+# Try different voting weights to optimize ensemble
+weight_combinations <- list(
+  c(1, 1, 1),  # Equal weights
+  c(2, 1, 1),  # More weight to RF
+  c(1, 2, 1),  # More weight to LR
+  c(1, 1, 2),  # More weight to LightGBM
+  c(3, 2, 1),  # Prioritize RF, then LR
+  c(3, 1, 2)   # Prioritize RF, then LightGBM
+)
+
+# Evaluate each weight combination
+weight_results <- data.frame()
+for(i in 1:length(weight_combinations)) {
+  weights <- weight_combinations[[i]]
+  voting_preds <- soft_voting_predict(train_probs, weights)
+
+  # Calculate accuracy
+  accuracy <- sum(voting_preds$predicted == y_train) / length(y_train)
+
+  # Store results
+  weight_results <- rbind(weight_results, data.frame(
+    Weights = paste(weights, collapse = ":"),
+    Accuracy = accuracy
+  ))
+}
+
+# Find best weights
+best_weights_idx <- which.max(weight_results$Accuracy)
+best_weights <- weight_combinations[[best_weights_idx]]
+
+cat("Best voting weights:", paste(best_weights, collapse = ":"),
+    "with training accuracy:", round(weight_results$Accuracy[best_weights_idx], 4), "\n")
+
+# Use best weights for the final voting classifier
+```
+
+# 7. Model Evaluation
+
+```{r evaluate_models}
+# Make predictions with each individual model
+rf_preds <- predict(rf_model, X_test_scaled)
+lr_preds <- predict(lr_model, X_test_scaled)
+
+# For LightGBM
+lgb_prob <- predict(lgb_model, as.matrix(X_test_scaled))
+lgb_prob_matrix <- matrix(lgb_prob, ncol = length(levels(y_train)), byrow = TRUE)
+lgb_preds <- factor(max.col(lgb_prob_matrix), levels = 1:length(levels(y_train)))
+levels(lgb_preds) <- levels(y_train)
+
+# Get test set predictions for voting classifier
+test_probs <- get_all_model_probs(models, X_test_scaled, y_test)
+voting_results <- soft_voting_predict(test_probs, best_weights)
+voting_preds <- voting_results$predicted
+
+# Create confusion matrices
+rf_cm <- confusionMatrix(rf_preds, y_test)
+lr_cm <- confusionMatrix(lr_preds, y_test)
+lgb_cm <- confusionMatrix(lgb_preds, y_test)
+voting_cm <- confusionMatrix(voting_preds, y_test)
+
+# Print model performances
+print("Random Forest Performance:")
+print(rf_cm$overall)
+
+print("Logistic Regression Performance:")
+print(lr_cm$overall)
+
+print("LightGBM Performance:")
+print(lgb_cm$overall)
+
+print("Voting Classifier Performance:")
+print(voting_cm$overall)
+```
+
+```{r visualize_results}
+# Collect performance metrics
+models <- c("Random Forest", "Logistic Regression", "LightGBM", "Voting Classifier")
+accuracy <- c(
+  rf_cm$overall["Accuracy"],
+  lr_cm$overall["Accuracy"],
+  lgb_cm$overall["Accuracy"],
+  voting_cm$overall["Accuracy"]
+)
+kappa <- c(
+  rf_cm$overall["Kappa"],
+  lr_cm$overall["Kappa"],
+  lgb_cm$overall["Kappa"],
+  voting_cm$overall["Kappa"]
+)
+
+# Create comparison dataframe
+model_performance <- data.frame(
+  Model = models,
+  Accuracy = accuracy,
+  Kappa = kappa
+)
+
+# Plot comparison
+ggplot(model_performance, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.4f", Accuracy)), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Model Accuracy Comparison",
+       y = "Accuracy") +
+  theme_minimal() +
+  ylim(0, 1)
+```
+
+# 8. Feature Importance Analysis
+
+```{r feature_importance}
+# Get and visualize feature importance
+# For Random Forest
+rf_importance <- varImp(rf_model)
+plot(rf_importance, top = 20, main = "Random Forest Feature Importance")
+
+# For LightGBM
+if(nrow(lgb_importance) > 0) {
+  # Plot top features
+  top_n <- min(20, nrow(lgb_importance))
+  imp_data <- head(lgb_importance, top_n)
+
+  ggplot(imp_data, aes(x = reorder(Feature, Gain), y = Gain)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    labs(title = "LightGBM Top Feature Importance",
+         x = "Feature", y = "Gain") +
+    theme_minimal()
+}
+
+# For Logistic Regression (if available)
+if(any(grepl("varImp", methods(class = class(lr_model)[1])))) {
+  lr_importance <- varImp(lr_model)
+  plot(lr_importance, top = 20, main = "Logistic Regression Feature Importance")
+}
+
+# Analyze importance by feature type
+analyze_feature_types <- function() {
+  # Get importance data from Random Forest
+  if(exists("rf_importance")) {
+    # Extract importance data
+    importance_data <- rf_importance$importance
+    importance_data$Feature <- rownames(importance_data)
+
+    # Function to categorize features
+    get_feature_type <- function(feature_name) {
+      for(type in feature_types) {
+        if(grepl(type, feature_name)) {
+          return(type)
+        }
+      }
+      return("other")
+    }
+
+    # Categorize features and sum importance
+    importance_data$Type <- sapply(importance_data$Feature, get_feature_type)
+    type_importance <- aggregate(Overall ~ Type, importance_data, sum)
+
+    # Sort by importance
+    type_importance <- type_importance[order(type_importance$Overall, decreasing = TRUE), ]
+
+    # Plot
+    ggplot(type_importance, aes(x = reorder(Type, Overall), y = Overall)) +
+      geom_bar(stat = "identity", fill = "orange") +
+      coord_flip() +
+      labs(title = "Feature Importance by Non-Linear Feature Type",
+           x = "Feature Type", y = "Importance") +
+      theme_minimal()
+  }
+}
+
+# Run the feature type analysis
+analyze_feature_types()
+```
+
+# 9. Best Model Analysis
+
+```{r best_model_cm}
+# Determine and plot confusion matrix for best model
+best_cm <- switch(best_model,
+                 "Random Forest" = rf_cm,
+                 "Logistic Regression" = lr_cm,
+                 "LightGBM" = lgb_cm,
+                 "Voting Classifier" = voting_cm)
+
+# Create heatmap of confusion matrix
+cm_data <- as.data.frame(best_cm$table)
+colnames(cm_data) <- c("Reference", "Prediction", "Freq")
+
+# Plot confusion matrix heatmap
+ggplot(cm_data, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 4) +
+  scale_fill_viridis() +
+  labs(title = paste("Confusion Matrix -", best_model),
+       x = "Reference", y = "Prediction") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Calculate per-class metrics
+per_class_metrics <- data.frame(
+  Class = rownames(best_cm$byClass),
+  Sensitivity = best_cm$byClass[, "Sensitivity"],
+  Specificity = best_cm$byClass[, "Specificity"],
+  Precision = best_cm$byClass[, "Pos Pred Value"],
+  F1_Score = best_cm$byClass[, "F1"]
+)
+
+# Display per-class metrics
+print("Per-class performance metrics:")
+print(per_class_metrics)
+
+# Plot per-class metrics
+per_class_metrics_long <- melt(per_class_metrics, id.vars = "Class",
+                              variable.name = "Metric", value.name = "Value")
+
+ggplot(per_class_metrics_long, aes(x = Class, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_viridis_d() +
+  labs(title = paste("Per-Class Performance Metrics -", best_model),
+       x = "Class", y = "Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylim(0, 1)
+```
+
+# 10. Conclusion
+
+```{r conclusion}
+# Determine and plot confusion matrix for best model
+best_cm <- switch(best_model,
+                 "Random Forest" = rf_cm,
+                 "Logistic Regression" = lr_cm,
+                 "LightGBM" = lgb_cm,
+                 "Voting Classifier" = voting_cm)
+
+# Create heatmap of confusion matrix
+cm_data <- as.data.frame(best_cm$table)
+colnames(cm_data) <- c("Reference", "Prediction", "Freq")
+
+# Plot confusion matrix heatmap
+ggplot(cm_data, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 4) +
+  scale_fill_viridis() +
+  labs(title = paste("Confusion Matrix -", best_model),
+       x = "Reference", y = "Prediction") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Calculate per-class metrics
+per_class_metrics <- data.frame(
+  Class = rownames(best_cm$byClass),
+  Sensitivity = best_cm$byClass[, "Sensitivity"],
+  Specificity = best_cm$byClass[, "Specificity"],
+  Precision = best_cm$byClass[, "Pos Pred Value"],
+  F1_Score = best_cm$byClass[, "F1"]
+)
+
+# Display per-class metrics
+print("Per-class performance metrics:")
+print(per_class_metrics)
+
+# Plot per-class metrics
+per_class_metrics_long <- melt(per_class_metrics, id.vars = "Class",
+                              variable.name = "Metric", value.name = "Value")
+
+ggplot(per_class_metrics_long, aes(x = Class, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_viridis_d() +
+  labs(title = paste("Per-Class Performance Metrics -", best_model),
+       x = "Class", y = "Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylim(0, 1)
+```
+# Find best model
+best_idx <- which.max(model_performance$Accuracy)
+best_model <- model_performance$Model[best_idx]
+
+cat("Best performing model:", best_model, "\n")
+cat("Accuracy:", model_performance$Accuracy[best_idx], "\n")
+cat("Kappa:", model_performance$Kappa[best_idx], "\n")
+
+# Compare voting classifier with individual models
+if(best_model == "Voting Classifier") {
+  improvement_rf <- (voting_cm$overall["Accuracy"] - rf_cm$overall["Accuracy"]) / rf_cm$overall["Accuracy"] * 100
+  improvement_lr <- (voting_cm$overall["Accuracy"] - lr_cm$overall["Accuracy"]) / lr_cm$overall["Accuracy"] * 100
+  improvement_lgb <- (voting_cm$overall["Accuracy"] - lgb_cm$overall["Accuracy"]) / lgb_cm$overall["Accuracy"] * 100
+
+  cat("\nVoting Classifier improvements:\n")
+  cat("- Compared to Random Forest:", round(improvement_rf, 2), "% improvement\n")
+  cat("- Compared to Logistic Regression:", round(improvement_lr, 2), "% improvement\n")
+  cat("- Compared to LightGBM:", round(improvement_lgb, 2), "% improvement\n")
+}
+
+# Determine most important feature types
+if(exists("rf_importance")) {
+  important_features <- rownames(rf_importance$importance)[order(rf_importance$importance$Overall, decreasing = TRUE)]
+  top_features <- head(important_features, 10)
+
+  # Extract feature types from top features
+  top_types <- sapply(top_features, function(feature) {
+    for(type in feature_types) {
+      if(grepl(type, feature)) {
+        return(type)
+      }
+    }
+    return("other")
+  })
+
+  # Count occurrences of each type
+  type_counts <- table(top_types)
+  most_important_type <- names(type_counts)[which.max(type_counts)]
+
+  cat("\nMost common feature type in top 10 features:", most_important_type, "\n")
+  cat("Top 10 features:\n")
+  cat(paste("  -", top_features), sep = "\n")
+}
+
+cat("\nSummary of Non-Linear EEG Analysis with Voting Classifier:\n")
+cat("1. Non-linear features like fractal dimensions and entropy measures show predictive power\n")
+cat("2. The most effective model was", best_model, "with accuracy of", round(model_performance$Accuracy[best_idx], 4), "\n")
+cat("3. Voting classifier with optimized weights:", paste(best_weights, collapse = ":"), "provides improved prediction stability\n")
+cat("4. Further research could explore combining these non-linear features with time and frequency domain features\n")
+```

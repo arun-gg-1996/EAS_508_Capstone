@@ -438,7 +438,7 @@ def run():
 
     # Run with test_mode=True for a quick test with 5% of the data
     # Set to False for processing the full dataset
-    embeddings_df = main(test_mode=True, visualize=True)
+    embeddings_df = main(test_mode=False, visualize=True)
 
     elapsed_time = time.time() - start_time
     minutes, seconds = divmod(elapsed_time, 60)

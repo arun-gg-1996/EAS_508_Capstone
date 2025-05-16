@@ -1,0 +1,593 @@
+---
+title: "EEG Non-Linear Features Analysis with Individual Models"
+author: "Data Scientist"
+date: "May 15, 2025"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6)
+```
+
+# 1. Introduction
+
+This analysis explores EEG non-linear features to predict expert consensus classifications. We'll implement:
+
+- Basic data exploration of features like fractal dimensions, entropy measures, and complexity
+- Three machine learning models evaluated independently:
+  - LightGBM
+  - Random Forest
+  - Logistic Regression (Multinomial)
+- Feature importance analysis focused on non-linear measures
+
+# 2. Environment Setup
+
+```{r load_libraries}
+# Load necessary libraries
+library(tidyverse)
+library(caret)
+library(ranger)
+library(lightgbm)
+library(e1071)
+library(ggplot2)
+library(corrplot)
+library(doParallel)
+library(pROC)
+library(reshape2)
+library(viridis)
+library(nnet)  # For multinom method (multinomial logistic regression)
+
+# Set seed for reproducibility
+set.seed(42)
+
+# Set up parallel processing
+registerDoParallel(cores = parallel::detectCores() - 1)
+```
+
+# 3. Data Loading and Exploration
+
+```{r load_data}
+file_path <- file.path("..", "out", "test", "eeg_nonlinear_domain_features_test.csv")
+# Load data directly
+nonlinear_data <- read.csv(file_path)
+# Step 2: Sample 50% of rows randomly
+set.seed(42)  # For reproducibility
+sampled_rows <- sample(1:nrow(nonlinear_data), size = floor(nrow(nonlinear_data) * 1))
+nonlinear_data <- nonlinear_data[sampled_rows, ]
+
+# Basic data information
+cat("Data dimensions:", nrow(nonlinear_data), "rows and", ncol(nonlinear_data), "columns\n")
+
+# Structure of data
+str(nonlinear_data, list.len = 10)
+
+# Check for missing values
+missing_values <- colSums(is.na(nonlinear_data))
+if(sum(missing_values) > 0) {
+  cat("Missing values found in", sum(missing_values > 0), "columns\n")
+} else {
+  cat("No missing values found in the dataset\n")
+}
+
+# Convert target to factor
+nonlinear_data$expert_consensus <- as.factor(nonlinear_data$expert_consensus)
+
+# Target distribution
+target_dist <- table(nonlinear_data$expert_consensus)
+print("Class distribution:")
+print(target_dist)
+```
+
+```{r visualize_target}
+# Visualize class distribution
+barplot_data <- data.frame(
+  Class = names(target_dist),
+  Count = as.numeric(target_dist)
+)
+
+ggplot(barplot_data, aes(x = Class, y = Count, fill = Class)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = Count), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Distribution of Expert Consensus Classes",
+       x = "Class", y = "Count") +
+  theme_minimal()
+```
+
+# 4. Data Preprocessing and Feature Analysis
+
+```{r preprocess_data}
+# Remove ID columns for modeling
+feature_cols <- setdiff(names(nonlinear_data), c("eeg_id", "eeg_sub_id", "expert_consensus"))
+X <- nonlinear_data[, feature_cols]
+y <- nonlinear_data$expert_consensus
+
+# Split data into training and testing sets (70/30)
+if(nrow(nonlinear_data) > 5) {
+  train_index <- createDataPartition(y, p = 0.7, list = FALSE)
+  X_train <- X[train_index, ]
+  X_test <- X[-train_index, ]
+  y_train <- y[train_index]
+  y_test <- y[-train_index]
+} else {
+  cat("Dataset too small for splitting, using all data for demonstration\n")
+  X_train <- X
+  X_test <- X
+  y_train <- y
+  y_test <- y
+}
+
+# Feature preprocessing - standardize
+preProc <- preProcess(X_train, method = c("center", "scale"))
+X_train_scaled <- predict(preProc, X_train)
+X_test_scaled <- predict(preProc, X_test)
+
+# Basic feature statistics
+cat("Number of features:", ncol(X), "\n")
+
+# Create correlation matrix for visualization
+if(ncol(X) > 30) {
+  # Sample some features for better visualization
+  set.seed(123)
+  sample_features <- sample(names(X), 30)
+  corr_subset <- cor(X[, sample_features])
+  corrplot(corr_subset, method = "circle",
+           type = "upper", tl.cex = 0.6,
+           tl.col = "black", tl.srt = 45,
+           title = "Sample Feature Correlation")
+} else {
+  corr_matrix <- cor(X)
+  corrplot(corr_matrix, method = "circle",
+           type = "upper", tl.cex = 0.6,
+           tl.col = "black", tl.srt = 45,
+           title = "Feature Correlation")
+}
+```
+
+```{r feature_types_analysis}
+# Analyze non-linear feature types
+feature_types <- c("petrosian_fd", "katz_fd", "higuchi_fd", "dfa",
+                  "sample_entropy", "perm_entropy", "spectral_entropy",
+                  "binary_complexity")
+
+# Count features by type
+feature_counts <- sapply(feature_types, function(type) {
+  sum(grepl(type, names(X)))
+})
+
+# Count features by channel
+channel_counts <- sapply(0:19, function(channel) {
+  sum(grepl(paste0("channel_", channel, "_"), names(X)))
+})
+
+# Plot feature type distribution
+par(mfrow = c(1, 2))
+barplot(feature_counts, main = "Non-Linear Feature Types",
+        col = "skyblue", las = 2, cex.names = 0.8)
+barplot(channel_counts, main = "Features by Channel",
+        col = "lightgreen", las = 2, cex.names = 0.8,
+        names.arg = paste0("Ch", 0:19))
+par(mfrow = c(1, 1))
+
+# Display basic statistics for each feature type
+feature_stats <- lapply(feature_types, function(type) {
+  cols <- grep(type, names(X), value = TRUE)
+  if(length(cols) > 0) {
+    data.frame(
+      Feature_Type = type,
+      Mean = mean(sapply(cols, function(col) mean(X[[col]], na.rm = TRUE))),
+      Std_Dev = mean(sapply(cols, function(col) sd(X[[col]], na.rm = TRUE))),
+      Min = min(sapply(cols, function(col) min(X[[col]], na.rm = TRUE))),
+      Max = max(sapply(cols, function(col) max(X[[col]], na.rm = TRUE)))
+    )
+  }
+})
+feature_stats_df <- do.call(rbind, feature_stats)
+print(feature_stats_df)
+```
+
+# 5. Individual Model Training
+
+## 5.1 Random Forest Model
+
+```{r train_rf}
+# Define common training control settings
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  classProbs = TRUE,
+  savePredictions = "final"
+)
+
+# Train Random Forest
+set.seed(42)
+rf_model <- train(
+  x = X_train_scaled,
+  y = y_train,
+  method = "ranger",
+  trControl = train_control,
+  tuneLength = 3,
+  importance = 'impurity'
+)
+
+print(rf_model)
+print(rf_model$bestTune)
+```
+
+## 5.2 Logistic Regression Model
+
+```{r train_lr}
+# Train Logistic Regression
+set.seed(42)
+lr_model <- train(
+  x = X_train_scaled,
+  y = y_train,
+  method = "multinom",  # Multinomial logistic regression
+  trControl = train_control,
+  tuneLength = 3,
+  trace = FALSE  # Suppress iteration output
+)
+
+print(lr_model)
+print(lr_model$bestTune)
+```
+
+## 5.3 LightGBM Model
+
+```{r train_lgb}
+# LightGBM needs special handling
+# First convert data to matrix format
+dtrain <- lgb.Dataset(
+  data = as.matrix(X_train_scaled),
+  label = as.integer(y_train) - 1
+)
+
+# Set LightGBM parameters
+lgb_params <- list(
+  objective = "multiclass",
+  metric = "multi_logloss",
+  num_class = length(levels(y_train)),
+  learning_rate = 0.1,
+  max_depth = 6,
+  num_leaves = 31
+)
+
+# Train LightGBM model
+set.seed(42)
+lgb_model <- lgb.train(
+  params = lgb_params,
+  data = dtrain,
+  nrounds = 100,
+  verbose = 0
+)
+
+# Get variable importance from LightGBM
+lgb_importance <- lgb.importance(lgb_model, percentage = TRUE)
+head(lgb_importance, 10)
+```
+
+# 6. Model Evaluation
+
+## 6.1 Model Predictions
+
+```{r model_predictions}
+# Make predictions with each individual model
+rf_preds <- predict(rf_model, X_test_scaled)
+lr_preds <- predict(lr_model, X_test_scaled)
+
+# For LightGBM
+lgb_prob <- predict(lgb_model, as.matrix(X_test_scaled))
+lgb_prob_matrix <- matrix(lgb_prob, ncol = length(levels(y_train)), byrow = TRUE)
+lgb_preds <- factor(max.col(lgb_prob_matrix), levels = 1:length(levels(y_train)))
+levels(lgb_preds) <- levels(y_train)
+
+# Create confusion matrices
+rf_cm <- confusionMatrix(rf_preds, y_test)
+lr_cm <- confusionMatrix(lr_preds, y_test)
+lgb_cm <- confusionMatrix(lgb_preds, y_test)
+```
+
+## 6.2 Model Performance Metrics
+
+```{r model_performance}
+# Print model performances
+print("Random Forest Performance:")
+print(rf_cm$overall)
+
+print("Logistic Regression Performance:")
+print(lr_cm$overall)
+
+print("LightGBM Performance:")
+print(lgb_cm$overall)
+
+# Collect performance metrics
+models <- c("Random Forest", "Logistic Regression", "LightGBM")
+accuracy <- c(
+  rf_cm$overall["Accuracy"],
+  lr_cm$overall["Accuracy"],
+  lgb_cm$overall["Accuracy"]
+)
+kappa <- c(
+  rf_cm$overall["Kappa"],
+  lr_cm$overall["Kappa"],
+  lgb_cm$overall["Kappa"]
+)
+
+# Create comparison dataframe
+model_performance <- data.frame(
+  Model = models,
+  Accuracy = accuracy,
+  Kappa = kappa
+)
+
+# Display comparison table
+print(model_performance)
+```
+
+## 6.3 Performance Visualization
+
+```{r visualize_performance}
+# Plot comparison
+ggplot(model_performance, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.4f", Accuracy)), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Model Accuracy Comparison",
+       y = "Accuracy") +
+  theme_minimal() +
+  ylim(0, 1)
+
+# Plot kappa comparison
+ggplot(model_performance, aes(x = Model, y = Kappa, fill = Model)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.4f", Kappa)), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Model Kappa Comparison",
+       y = "Kappa") +
+  theme_minimal() +
+  ylim(0, 1)
+```
+
+# 7. Feature Importance Analysis
+
+## 7.1 Random Forest Feature Importance
+
+```{r rf_importance}
+# Get and visualize feature importance for Random Forest
+rf_importance <- varImp(rf_model)
+plot(rf_importance, top = 20, main = "Random Forest Feature Importance")
+
+# Display top 20 features in a table
+top_rf_features <- rf_importance$importance
+top_rf_features$Feature <- rownames(top_rf_features)
+top_rf_features <- top_rf_features[order(top_rf_features$Overall, decreasing = TRUE), ]
+head(top_rf_features, 20)
+```
+
+## 7.2 LightGBM Feature Importance
+
+```{r lgb_importance}
+# For LightGBM
+if(nrow(lgb_importance) > 0) {
+  # Plot top features
+  top_n <- min(20, nrow(lgb_importance))
+  imp_data <- head(lgb_importance, top_n)
+
+  ggplot(imp_data, aes(x = reorder(Feature, Gain), y = Gain)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    labs(title = "LightGBM Top Feature Importance",
+         x = "Feature", y = "Gain") +
+    theme_minimal()
+    
+  # Display top 20 features in a table
+  head(lgb_importance, 20)
+}
+```
+
+## 7.3 Logistic Regression Feature Importance
+
+```{r lr_importance}
+# For Logistic Regression (if available)
+if(any(grepl("varImp", methods(class = class(lr_model)[1])))) {
+  lr_importance <- varImp(lr_model)
+  plot(lr_importance, top = 20, main = "Logistic Regression Feature Importance")
+  
+  # Display top 20 features in a table
+  top_lr_features <- lr_importance$importance
+  top_lr_features$Feature <- rownames(top_lr_features)
+  top_lr_features <- top_lr_features[order(top_lr_features$Overall, decreasing = TRUE), ]
+  head(top_lr_features, 20)
+}
+```
+
+## 7.4 Feature Type Importance Analysis
+
+```{r feature_type_analysis}
+# Analyze importance by feature type
+analyze_feature_types <- function() {
+  # Get importance data from Random Forest
+  if(exists("rf_importance")) {
+    # Extract importance data
+    importance_data <- rf_importance$importance
+    importance_data$Feature <- rownames(importance_data)
+
+    # Function to categorize features
+    get_feature_type <- function(feature_name) {
+      for(type in feature_types) {
+        if(grepl(type, feature_name)) {
+          return(type)
+        }
+      }
+      return("other")
+    }
+
+    # Categorize features and sum importance
+    importance_data$Type <- sapply(importance_data$Feature, get_feature_type)
+    type_importance <- aggregate(Overall ~ Type, importance_data, sum)
+
+    # Sort by importance
+    type_importance <- type_importance[order(type_importance$Overall, decreasing = TRUE), ]
+    
+    # Display table
+    print(type_importance)
+
+    # Plot
+    ggplot(type_importance, aes(x = reorder(Type, Overall), y = Overall)) +
+      geom_bar(stat = "identity", fill = "orange") +
+      coord_flip() +
+      labs(title = "Feature Importance by Non-Linear Feature Type (Random Forest)",
+           x = "Feature Type", y = "Importance") +
+      theme_minimal()
+  }
+}
+
+# Run the feature type analysis
+analyze_feature_types()
+
+# Do the same for LightGBM if possible
+if(exists("lgb_importance") && nrow(lgb_importance) > 0) {
+  # Function to categorize features
+  get_feature_type <- function(feature_name) {
+    for(type in feature_types) {
+      if(grepl(type, feature_name)) {
+        return(type)
+      }
+    }
+    return("other")
+  }
+  
+  # Add type column
+  lgb_importance$Type <- sapply(lgb_importance$Feature, get_feature_type)
+  
+  # Aggregate by type
+  lgb_type_importance <- aggregate(Gain ~ Type, lgb_importance, sum)
+  
+  # Sort by importance
+  lgb_type_importance <- lgb_type_importance[order(lgb_type_importance$Gain, decreasing = TRUE), ]
+  
+  # Display table
+  print(lgb_type_importance)
+  
+  # Plot
+  ggplot(lgb_type_importance, aes(x = reorder(Type, Gain), y = Gain)) +
+    geom_bar(stat = "identity", fill = "lightblue") +
+    coord_flip() +
+    labs(title = "Feature Importance by Non-Linear Feature Type (LightGBM)",
+         x = "Feature Type", y = "Gain") +
+    theme_minimal()
+}
+```
+
+# 8. Detailed Model Analysis
+
+## 8.1 Best Model Identification 
+
+```{r best_model}
+# Find best model
+best_idx <- which.max(model_performance$Accuracy)
+best_model <- model_performance$Model[best_idx]
+
+cat("Best performing model:", best_model, "\n")
+cat("Accuracy:", model_performance$Accuracy[best_idx], "\n")
+cat("Kappa:", model_performance$Kappa[best_idx], "\n")
+```
+
+## 8.2 Best Model Confusion Matrix
+
+```{r best_model_cm}
+# Get the confusion matrix for the best model
+best_cm <- switch(best_model,
+                 "Random Forest" = rf_cm,
+                 "Logistic Regression" = lr_cm,
+                 "LightGBM" = lgb_cm)
+
+# Create heatmap of confusion matrix
+cm_data <- as.data.frame(best_cm$table)
+colnames(cm_data) <- c("Reference", "Prediction", "Freq")
+
+# Plot confusion matrix heatmap
+ggplot(cm_data, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 4) +
+  scale_fill_viridis() +
+  labs(title = paste("Confusion Matrix -", best_model),
+       x = "Reference", y = "Prediction") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Print confusion matrix details
+print(best_cm$table)
+```
+
+## 8.3 Per-Class Performance Metrics
+
+```{r per_class_metrics}
+# Calculate per-class metrics
+per_class_metrics <- data.frame(
+  Class = rownames(best_cm$byClass),
+  Sensitivity = best_cm$byClass[, "Sensitivity"],
+  Specificity = best_cm$byClass[, "Specificity"],
+  Precision = best_cm$byClass[, "Pos Pred Value"],
+  F1_Score = best_cm$byClass[, "F1"]
+)
+
+# Display per-class metrics
+print("Per-class performance metrics:")
+print(per_class_metrics)
+
+# Plot per-class metrics
+per_class_metrics_long <- melt(per_class_metrics, id.vars = "Class",
+                              variable.name = "Metric", value.name = "Value")
+
+ggplot(per_class_metrics_long, aes(x = Class, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_viridis_d() +
+  labs(title = paste("Per-Class Performance Metrics -", best_model),
+       x = "Class", y = "Score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ylim(0, 1)
+```
+
+# 9. Conclusion
+
+```{r conclusion}
+# Determine most important feature types across models
+if(exists("rf_importance")) {
+  important_features <- rownames(rf_importance$importance)[order(rf_importance$importance$Overall, decreasing = TRUE)]
+  top_features <- head(important_features, 10)
+
+  # Extract feature types from top features
+  top_types <- sapply(top_features, function(feature) {
+    for(type in feature_types) {
+      if(grepl(type, feature)) {
+        return(type)
+      }
+    }
+    return("other")
+  })
+
+  # Count occurrences of each type
+  type_counts <- table(top_types)
+  most_important_type <- names(type_counts)[which.max(type_counts)]
+
+  cat("\nMost common feature type in top 10 features:", most_important_type, "\n")
+  cat("Top 10 features:\n")
+  cat(paste("  -", top_features), sep = "\n")
+}
+
+cat("\nSummary of Non-Linear EEG Analysis:\n")
+cat("1. Non-linear features like fractal dimensions and entropy measures show predictive power\n")
+cat("2. The most effective model was", best_model, "with accuracy of", round(model_performance$Accuracy[best_idx], 4), "\n")
+cat("3. Feature importance analysis reveals that", most_important_type, "features contribute significantly to predictions\n")
+cat("4. Further research could explore optimizing model hyperparameters and combining these non-linear features with time and frequency domain features\n")
+```

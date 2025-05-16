@@ -1,0 +1,337 @@
+# EEG Frequency Domain Features Analysis with Multiple Models and Voting Classifier
+
+# Setup Environment
+library(tidyverse)
+library(caret)
+library(ranger)
+library(lightgbm)
+library(e1071)
+library(ggplot2)
+library(corrplot)
+library(doParallel)
+library(pROC)
+library(reshape2)
+library(viridis)
+library(caretEnsemble)
+library(nnet)  # For multinom method (multinomial logistic regression)
+
+# Set seed for reproducibility
+set.seed(42)
+
+# Set up parallel processing
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+# Load data directly
+frequency_data <- read.csv("eeg_frequency_domain_features_test.csv")
+
+# Basic data information
+cat("Data dimensions:", nrow(frequency_data), "rows and", ncol(frequency_data), "columns\n")
+
+# Check for missing values
+missing_values <- colSums(is.na(frequency_data))
+if(sum(missing_values) > 0) {
+  cat("Missing values found in", sum(missing_values > 0), "columns\n")
+} else {
+  cat("No missing values found in the dataset\n")
+}
+
+# Convert target to factor
+frequency_data$expert_consensus <- as.factor(frequency_data$expert_consensus)
+
+# Target distribution
+target_dist <- table(frequency_data$expert_consensus)
+print("Class distribution:")
+print(target_dist)
+
+# Visualize class distribution
+barplot_data <- data.frame(
+  Class = names(target_dist),
+  Count = as.numeric(target_dist)
+)
+
+ggplot(barplot_data, aes(x = Class, y = Count, fill = Class)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = Count), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Distribution of Expert Consensus Classes",
+       x = "Class", y = "Count") +
+  theme_minimal()
+
+# Remove ID columns for modeling
+feature_cols <- setdiff(names(frequency_data), c("eeg_id", "eeg_sub_id", "expert_consensus"))
+X <- frequency_data[, feature_cols]
+y <- frequency_data$expert_consensus
+
+# Split data into training and testing sets (70/30)
+train_index <- createDataPartition(y, p = 0.7, list = FALSE)
+X_train <- X[train_index, ]
+X_test <- X[-train_index, ]
+y_train <- y[train_index]
+y_test <- y[-train_index]
+
+# Feature preprocessing - standardize
+preProc <- preProcess(X_train, method = c("center", "scale"))
+X_train_scaled <- predict(preProc, X_train)
+X_test_scaled <- predict(preProc, X_test)
+
+# Basic feature statistics
+cat("Number of features:", ncol(X), "\n")
+
+# Analyze frequency domain feature types
+feature_types <- c("total_power", "delta_power", "delta_relative_power",
+                  "theta_power", "theta_relative_power",
+                  "alpha_power", "alpha_relative_power",
+                  "beta_power", "beta_relative_power",
+                  "gamma_power", "gamma_relative_power",
+                  "peak_frequency")
+
+# Define common training control settings
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = FALSE,
+  classProbs = TRUE,
+  savePredictions = "final"
+)
+
+# Train Random Forest
+set.seed(42)
+rf_model <- train(
+  x = X_train_scaled,
+  y = y_train,
+  method = "ranger",
+  trControl = train_control,
+  tuneLength = 3,
+  importance = 'impurity'
+)
+
+# Train Logistic Regression
+set.seed(42)
+lr_model <- train(
+  x = X_train_scaled,
+  y = y_train,
+  method = "multinom",  # Multinomial logistic regression
+  trControl = train_control,
+  tuneLength = 3,
+  trace = FALSE  # Suppress iteration output
+)
+
+# LightGBM needs special handling
+# First convert data to matrix format
+dtrain <- lgb.Dataset(
+  data = as.matrix(X_train_scaled),
+  label = as.integer(y_train) - 1
+)
+
+# Set LightGBM parameters
+lgb_params <- list(
+  objective = "multiclass",
+  metric = "multi_logloss",
+  num_class = length(levels(y_train)),
+  learning_rate = 0.1,
+  max_depth = 6,
+  num_leaves = 31
+)
+
+# Train LightGBM model
+set.seed(42)
+lgb_model <- lgb.train(
+  params = lgb_params,
+  data = dtrain,
+  nrounds = 100,
+  verbose = 0
+)
+
+# Get variable importance from LightGBM
+lgb_importance <- lgb.importance(lgb_model, percentage = TRUE)
+
+# We'll create a soft voting classifier
+# For this, we need predictions from all models
+
+# Function to get probabilities for all models
+get_all_model_probs <- function(models, X_scaled, y_true) {
+  # Random Forest probs
+  rf_probs <- predict(models$rf, X_scaled, type = "prob")
+
+  # Logistic Regression probs
+  lr_probs <- predict(models$lr, X_scaled, type = "prob")
+
+  # LightGBM probs
+  lgb_raw_probs <- predict(models$lgb, as.matrix(X_scaled))
+  lgb_probs_matrix <- matrix(lgb_raw_probs,
+                            ncol = length(levels(y_true)),
+                            byrow = TRUE)
+  lgb_probs <- as.data.frame(lgb_probs_matrix)
+  colnames(lgb_probs) <- levels(y_true)
+
+  # Return list of probability dataframes
+  return(list(
+    rf = rf_probs,
+    lr = lr_probs,
+    lgb = lgb_probs
+  ))
+}
+
+# Function to make soft voting predictions
+soft_voting_predict <- function(all_probs, weights = c(1, 1, 1)) {
+  # Normalize weights
+  weights <- weights / sum(weights)
+
+  # Weighted average of probabilities
+  rf_weighted <- all_probs$rf * weights[1]
+  lr_weighted <- all_probs$lr * weights[2]
+  lgb_weighted <- all_probs$lgb * weights[3]
+
+  # Sum the weighted probabilities
+  ensemble_probs <- rf_weighted + lr_weighted + lgb_weighted
+
+  # Get predicted classes
+  predicted_classes <- factor(colnames(ensemble_probs)[max.col(ensemble_probs)],
+                             levels = colnames(ensemble_probs))
+
+  return(list(
+    predicted = predicted_classes,
+    probabilities = ensemble_probs
+  ))
+}
+
+# Package all models for convenience
+models <- list(
+  rf = rf_model,
+  lr = lr_model,
+  lgb = lgb_model
+)
+
+# Get probabilities for training data
+train_probs <- get_all_model_probs(models, X_train_scaled, y_train)
+
+# Try different voting weights to optimize ensemble
+weight_combinations <- list(
+  c(1, 1, 1),  # Equal weights
+  c(2, 1, 1),  # More weight to RF
+  c(1, 2, 1),  # More weight to LR
+  c(1, 1, 2),  # More weight to LightGBM
+  c(3, 2, 1),  # Prioritize RF, then LR
+  c(3, 1, 2)   # Prioritize RF, then LightGBM
+)
+
+# Evaluate each weight combination
+weight_results <- data.frame()
+for(i in 1:length(weight_combinations)) {
+  weights <- weight_combinations[[i]]
+  voting_preds <- soft_voting_predict(train_probs, weights)
+
+  # Calculate accuracy
+  accuracy <- sum(voting_preds$predicted == y_train) / length(y_train)
+
+  # Store results
+  weight_results <- rbind(weight_results, data.frame(
+    Weights = paste(weights, collapse = ":"),
+    Accuracy = accuracy
+  ))
+}
+
+# Find best weights
+best_weights_idx <- which.max(weight_results$Accuracy)
+best_weights <- weight_combinations[[best_weights_idx]]
+
+cat("Best voting weights:", paste(best_weights, collapse = ":"),
+    "with training accuracy:", round(weight_results$Accuracy[best_weights_idx], 4), "\n")
+
+# Make predictions with each individual model
+rf_preds <- predict(rf_model, X_test_scaled)
+lr_preds <- predict(lr_model, X_test_scaled)
+
+# For LightGBM
+lgb_prob <- predict(lgb_model, as.matrix(X_test_scaled))
+lgb_prob_matrix <- matrix(lgb_prob, ncol = length(levels(y_train)), byrow = TRUE)
+lgb_preds <- factor(max.col(lgb_prob_matrix), levels = 1:length(levels(y_train)))
+levels(lgb_preds) <- levels(y_train)
+
+# Get test set predictions for voting classifier
+test_probs <- get_all_model_probs(models, X_test_scaled, y_test)
+voting_results <- soft_voting_predict(test_probs, best_weights)
+voting_preds <- voting_results$predicted
+
+# Create confusion matrices
+rf_cm <- confusionMatrix(rf_preds, y_test)
+lr_cm <- confusionMatrix(lr_preds, y_test)
+lgb_cm <- confusionMatrix(lgb_preds, y_test)
+voting_cm <- confusionMatrix(voting_preds, y_test)
+
+# Print model performances
+print("Random Forest Performance:")
+print(rf_cm$overall)
+
+print("Logistic Regression Performance:")
+print(lr_cm$overall)
+
+print("LightGBM Performance:")
+print(lgb_cm$overall)
+
+print("Voting Classifier Performance:")
+print(voting_cm$overall)
+
+# Collect performance metrics
+models <- c("Random Forest", "Logistic Regression", "LightGBM", "Voting Classifier")
+accuracy <- c(
+  rf_cm$overall["Accuracy"],
+  lr_cm$overall["Accuracy"],
+  lgb_cm$overall["Accuracy"],
+  voting_cm$overall["Accuracy"]
+)
+kappa <- c(
+  rf_cm$overall["Kappa"],
+  lr_cm$overall["Kappa"],
+  lgb_cm$overall["Kappa"],
+  voting_cm$overall["Kappa"]
+)
+
+# Create comparison dataframe
+model_performance <- data.frame(
+  Model = models,
+  Accuracy = accuracy,
+  Kappa = kappa
+)
+
+# Plot comparison
+ggplot(model_performance, aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.4f", Accuracy)), vjust = -0.5) +
+  scale_fill_viridis_d() +
+  labs(title = "Model Accuracy Comparison",
+       y = "Accuracy") +
+  theme_minimal() +
+  ylim(0, 1)
+
+# Find best model
+best_idx <- which.max(model_performance$Accuracy)
+best_model <- model_performance$Model[best_idx]
+
+# Best model confusion matrix
+best_cm <- switch(best_model,
+                 "Random Forest" = rf_cm,
+                 "Logistic Regression" = lr_cm,
+                 "LightGBM" = lgb_cm,
+                 "Voting Classifier" = voting_cm)
+
+# Display confusion matrix
+print(paste("Best model:", best_model))
+print(best_cm$table)
+
+# Print performance metrics
+cat("Best performing model:", best_model, "\n")
+cat("Accuracy:", model_performance$Accuracy[best_idx], "\n")
+cat("Kappa:", model_performance$Kappa[best_idx], "\n")
+
+# Compare voting classifier with individual models
+if(best_model == "Voting Classifier") {
+  improvement_rf <- (voting_cm$overall["Accuracy"] - rf_cm$overall["Accuracy"]) / rf_cm$overall["Accuracy"] * 100
+  improvement_lr <- (voting_cm$overall["Accuracy"] - lr_cm$overall["Accuracy"]) / lr_cm$overall["Accuracy"] * 100
+  improvement_lgb <- (voting_cm$overall["Accuracy"] - lgb_cm$overall["Accuracy"]) / lgb_cm$overall["Accuracy"] * 100
+
+  cat("\nVoting Classifier improvements:\n")
+  cat("- Compared to Random Forest:", round(improvement_rf, 2), "% improvement\n")
+  cat("- Compared to Logistic Regression:", round(improvement_lr, 2), "% improvement\n")
+  cat("- Compared to LightGBM:", round(improvement_lgb, 2), "% improvement\n")
+}

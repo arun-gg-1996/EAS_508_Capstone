@@ -56,7 +56,7 @@ OUTPUT_DIR = os.path.join(current_folder, "out")
 TRAIN_SPECTROGRAMS_DIR = os.path.join(DATA_FOLDER, 'train_spectrograms')
 OUTPUT_DIR_TEST = os.path.join(current_folder, "out", "test")
 TEST_SAMPLE_SIZE_VISION = 0.02
-VIT_EMBEDDINGS_PATH = os.path.join(OUTPUT_DIR_TEST, 'vit_embeddings.csv')
+VIT_EMBEDDINGS_PATH = os.path.join(OUTPUT_DIR, 'vit_embeddings.csv')
 VIT_EMBEDDINGS_PATH_TEST = os.path.join(OUTPUT_DIR_TEST, 'vit_embeddings_test.csv')
 
 OUTPUT_DIR_ANALYSIS_MAIN = os.path.join(current_folder, 'out', 'main', 'analysis')

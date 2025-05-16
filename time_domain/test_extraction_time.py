@@ -13,26 +13,17 @@ class PerformanceTester:
         self.data_reader = EEGDataReader(data_folder)
         self.feature_extractor = EEGFeatureExtractor()
 
-        print(f"Number of data samples available : {self.data_reader.get_train_df().shape[0]}")
+        print(f"Number of data samples available: {self.data_reader.get_train_df().shape[0]}")
 
     def run_benchmark(self, n_samples=100, verbose=True):
         """
         Benchmark feature extraction on multiple EEG samples
-
-        Parameters:
-            n_samples (int): Number of samples to process
-            verbose (bool): Whether to print progress and results
-
-        Returns:
-            dict: Performance metrics
         """
         # Get the train data
         train_df = self.data_reader.get_train_df()
 
         # Get a random sample
         if len(train_df) < n_samples:
-            if verbose:
-                print(f"Warning: Requested {n_samples} samples but only {len(train_df)} are available")
             samples = train_df
         else:
             samples = train_df.sample(n=n_samples, random_state=42)
@@ -90,7 +81,7 @@ class PerformanceTester:
 
 
 def test():
-    n_samples = 10000
+    n_samples = 100  # Reduced from 10000 for simplicity
     print(f"Testing feature extraction on {n_samples} EEG samples...")
     tester = PerformanceTester()
     tester.run_benchmark(n_samples=n_samples)

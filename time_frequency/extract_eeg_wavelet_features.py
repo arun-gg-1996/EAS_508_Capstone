@@ -95,4 +95,4 @@ def main(test_mode=True, fs=SAMPLE_RATE, wavelet='db4', level=5):
 if __name__ == "__main__":
     # By default, run in test mode
     # Change to main(False) to run on the full dataset
-    main(test_mode=True)
+    main(test_mode=False)
